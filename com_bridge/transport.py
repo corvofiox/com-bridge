@@ -653,6 +653,8 @@ class InputReceiver(_BoundThread):
         self._on_heartbeat = on_heartbeat
         # 对端通过心跳下发的方位(见 protocol.SIDE_CODE_*)
         self._on_peer_side = on_peer_side
+        # 回调异常计数(见 run() 里"回调异常必须可见"的说明)
+        self.callback_errors = 0
         self.peer_side: str | None = None
         # 诊断计数: 用来区分"没人发"和"发了但格式/端口不对"
         self.packets = 0        # 收到的原始 UDP 包数
@@ -720,8 +722,24 @@ class InputReceiver(_BoundThread):
             if self._on_event is not None:
                 try:
                     self._on_event(ev)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # ★★★ 回调异常必须**可见**(用户实测的隐性失效):
+                    #
+                    #   这里原来是 `except Exception: pass` —— 于是
+                    #   `_on_input_event` 里任何非 OSError 的异常(例如
+                    #   旧版 button() 的 `KeyError: 0`)都被**彻底吞掉**,
+                    #   日志里一个字都没有, 表现为"输入完全失效且无从排查"。
+                    #   现在: 计数 + 前若干次打印详情, 让现场有据可查。
+                    n = self.callback_errors + 1
+                    self.callback_errors = n
+                    if n <= 5:
+                        try:
+                            print(f"[{self.name}] !! 事件回调异常"
+                                  f"(第 {n} 次) type=0x{ev.type:02X} "
+                                  f"code=0x{ev.code:02X}: "
+                                  f"{type(exc).__name__}: {exc}", flush=True)
+                        except Exception:  # noqa: BLE001
+                            pass
 
     def diag(self) -> dict:
         return {

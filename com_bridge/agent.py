@@ -134,7 +134,8 @@ class Agent:
                  mute_local: bool = True, discover_timeout_s: float = 3.0,
                  prefer_rate: int = 48000, control_port: int | None = None,
                  tone_hz: float = 0.0, side: str = "right",
-                 enable_return: bool = True):
+                 enable_return: bool = True,
+                 enable_clipboard: bool = True):
         self.name = name
         self.mute_local = mute_local
         self.discover_timeout_s = discover_timeout_s
@@ -151,6 +152,9 @@ class Agent:
         # 时 server 与 agent 在同一进程会争抢该端口(独占绑定下必然失败),
         # 且单机上回传毫无意义, 因此可关闭。
         self.enable_return = enable_return
+        # 剪贴板同步开关: 便于 A/B 验证与用户按需关闭
+        # (用户报过"剪贴板引入后键盘失效", 有开关才能快速隔离)
+        self.enable_clipboard = enable_clipboard
         self._tone_phase = 0.0
 
         self.server_host = server_host
@@ -291,7 +295,8 @@ class Agent:
         # ★ 剪贴板跨屏同步(参考 Deskflow, 与 server 侧对称):
         #   副机复制 -> 发到主机的 CLIPBOARD_PORT;
         #   主机复制 -> 副机接收并写入本机剪贴板。
-        self._ensure_clipboard(host)
+        if self.enable_clipboard:
+            self._ensure_clipboard(host)
         if self.enable_return:
             # on_heartbeat: 主电脑也可能反向发心跳(它同样可能位于 NAT 后,
             # 例如虚拟机网络)。收到后把**回传**目标切到实际源地址, 保证
@@ -764,6 +769,25 @@ class Agent:
             self.stats["events_injected"] += 1
         except OSError:
             pass
+        except Exception as exc:  # noqa: BLE001
+            # ★★★ 必须捕获**所有**异常, 不能只捕 OSError(用户实测的回归):
+            #
+            #   旧代码只有 `except OSError: pass`。于是任何其它异常
+            #   (ValueError / AttributeError / TypeError ...) 都会一路上抛到
+            #   `InputReceiver` 的 `self._on_event(ev)`, 而那里是
+            #   `except Exception: pass` —— **静默吞掉, 日志里一个字都没有**。
+            #   表现就是"键盘完全无输入, 且没有任何错误线索", 极难排查。
+            #
+            #   现在: 捕获所有异常 + 计数 + 首次打印详情(类型与消息),
+            #   这样用户报问题时有据可查, 而且单个事件失败不会让整条
+            #   通路静默停摆。
+            n = self.stats.get("event_inject_errors", 0) + 1
+            self.stats["event_inject_errors"] = n
+            if n <= 5:
+                print(f"[agent] !! 注入事件失败(第 {n} 次) "
+                      f"type=0x{ev.type:02X} code=0x{ev.code:02X} "
+                      f"a=0x{ev.a:02X}: {type(exc).__name__}: {exc}",
+                      flush=True)
 
     def _release_stuck_inputs(self, reason: str) -> None:
         """把所有仍按住的键/鼠标键注入 up(按键卡死防护的补发动作)。

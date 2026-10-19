@@ -1060,14 +1060,26 @@ class InputInjector:
 
     @staticmethod
     def button(code: int, down: bool) -> None:
-        """code: 1=L 2=R 3=M 4=X1 5=X2"""
-        down_flag, up_flag, data = {
+        """code: 1=L 2=R 3=M 4=X1 5=X2
+
+        ★ 非法 code 必须**安全忽略**而不是抛 KeyError(实测踩到):
+          旧实现用字典直接查表, `code=0`(或任何协议不匹配的值)会抛
+          `KeyError: 0`。而 KeyError **不是 OSError**, agent 的
+          `_on_input_event` 只捕 OSError, 于是它一路上抛到
+          `InputReceiver` 的 `except Exception: pass` —— **静默吞掉,
+          日志里一个字都没有**, 表现为"输入完全失效且无从排查"。
+          现在改为 `.get(code)`, 未知按钮直接返回 0(不注入、不抛)。
+        """
+        spec = {
             1: (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, 0),
             2: (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, 0),
             3: (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, 0),
             4: (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, 0x0001),
             5: (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, 0x0002),
-        }[code]
+        }.get(int(code))
+        if spec is None:
+            return 0          # 未知按钮: 安全忽略
+        down_flag, up_flag, data = spec
         i = INPUT(type=INPUT_MOUSE)
         i.union.mi.mouseData = data
         i.union.mi.dwFlags = down_flag if down else up_flag
