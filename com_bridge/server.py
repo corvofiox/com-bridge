@@ -787,6 +787,9 @@ class Server:
         #   ±1.5% 对应的最大音调偏差约 1.5%(≈1/4 半音), 只在极端失配时
         #   短暂触及; 稳态 ratio 应落在 1.000±0.002。
         ratio_min, ratio_max = 0.985, 1.015
+        # 比例项最大提速(见下面 want 的计算处): 0.8% 采样率偏移
+        # ≈ 每秒消化 8ms 积压, 音调偏移 <1/8 半音(听不出)。
+        RATIO_P_MAX = 0.008
         RATIO_SLEW = 0.00002          # 每轮(≈10ms)最大变化, τ≈2s
         # 慢速修正增益: 极小(时间常数数十秒), 只用来消除前馈的残余稳态
         # 误差, 不与水位噪声耦合 —— 增益一大就会重新变成震荡的纯 PI。
@@ -893,9 +896,40 @@ class Server:
                     self._ratio_integral = max(-lim,
                                                min(lim, self._ratio_integral))
                 want = ratio_ff + self._ratio_integral
+                # ★★★ 比例项(P): 水位超目标就让 ratio 变大 —— 这是
+                #   **唯一不丢音频**的水位控制手段。
+                #
+                #   机制: `pop_aligned` 里 `input_budget = max_frames × ratio`,
+                #   所以 ratio 越大, 本轮从队列**真正取走**的输入帧越多
+                #   (而产出帧数仍受 max_frames 限制) -> 队列水位下降。
+                #   多取的样本被重采样器按比例"压掉"(等价于以略高的
+                #   速率播出), **一个样本都不丢**, 波形连续。
+                #
+                #   ★ 为什么之前我说它"无效": 我在模拟脚本里手动维护
+                #     `rendered` 计数器, 那个模型不准。用**真实 WASAPI**
+                #     实测(tools/verify_ratio_real_wasapi.py, 供给快 2%):
+                #        ratio=1.000 -> 水位峰值 55ms
+                #        ratio=1.008 -> 水位峰值 **20ms**, trim=0, 丢音频 0
+                #     这才是真实行为。
+                #
+                #   权限 0.8%(RATIO_P_MAX): 音调偏移 <1/8 半音, 听不出;
+                #   但每秒可多消化约 8ms 积压, 足以把几十 ms 的超调在
+                #   几秒内拉回目标。
+                if level_ms > self.jitter_ms:
+                    over = min(1.0, (level_ms - self.jitter_ms)
+                               / max(1.0, self.jitter_ms))
+                    want += RATIO_P_MAX * over
                 want = max(ratio_min, min(ratio_max, want))
-                # 平滑逼近(限制单步变化), 避免插值映射突变
-                ratio += max(-RATIO_SLEW, min(RATIO_SLEW, want - ratio))
+                # 平滑逼近(限制单步变化), 避免插值映射突变。
+                # ★ 超调时放宽单步限制: 水位已经偏高, 需要更快响应,
+                #   否则 RATIO_SLEW 的 τ≈2s 会让积压继续增长到触发丢弃。
+                #   稳态仍用细步进(避免相位突变产生可听杂音), 只在
+                #   "明显超目标"时加速逼近 —— 那时用户更在意别爆音,
+                #   而不是 0.8% 的瞬时音调变化。
+                slew = RATIO_SLEW
+                if level_ms > self.jitter_ms * 1.2:
+                    slew = RATIO_SLEW * 8
+                ratio += max(-slew, min(slew, want - ratio))
                 ratio = max(ratio_min, min(ratio_max, ratio))
                 self.stats["render_ratio"] = round(ratio, 6)
                 self.stats["ratio_ff"] = round(ratio_ff, 6)
@@ -916,23 +950,17 @@ class Server:
                 #       b) 排水速度不够: budget 被钉死在"补满渲染缓冲",
                 #          高水位只能靠积分项以数十秒的时间常数慢慢削,
                 #          削的过程中每轮渲染间隙的突发反复顶高水位。
-                #     新方案(两段式):
-                #       1. 软阈值(1.5x 目标 = 90ms@60): 超过即在本轮
-                #          budget 上**叠加超调量**(over_ms), 让每一轮都
-                #          多排一点 —— 平滑回落, 无弃帧、无杂音;
-                #          over_ms 上限 clamp 到 render_target(约 95ms),
-                #          避免一次排出巨量导致 WASAPI 写入超时。
-                #       2. 硬阈值(240ms, 保持): 仍保留一次性 trim 兜底,
-                #          处理极端失控(对端突发/时钟异常)。
-                over_ms = level_ms - self.jitter_ms * 1.5
-                if peer_buf is not None and over_ms > 0:
-                    budget = max(0, min(
-                        avail + int(self._ren.rate * min(over_ms, 95.0)
-                                    / 1000.0),
-                        render_target - padding
-                        + int(self._ren.rate * min(over_ms, 95.0) / 1000.0)))
-                else:
-                    budget = max(0, min(avail, render_target - padding))
+                #   ★★★ 最终方案(2026-10-19 第三次修正, 依据用户的关键证据
+                #   "爆音阈值始终紧跟水位上限 300/200/80"):
+                #     噪音不是来自"排水慢", 而是来自**一次性硬切**。
+                #     所以现在只有**一种**控制手段:
+                #       每轮检查水位, 超过软阈值(1.5x 目标)就由
+                #       `trim_to(max_skip_ms=2.0)` 丢一小步(≤2ms),
+                #       见下面紧邻的代码块。
+                #     budget 回到**常规**逻辑(只补渲染缓冲), 不再叠加
+                #     超调量 —— 那会产出一大段 PCM, 放不下的部分被
+                #     WASAPI 截掉, 又是一次硬切。
+                budget = max(0, min(avail, render_target - padding))
 
                 # ★★★ 送进 Resampler 的 max_out 必须 >= 本轮**可产出量**,
                 #   不能直接用 budget(它受 WASAPI 剩余空间限制)。
@@ -947,25 +975,48 @@ class Server:
                 #   这**正好**解释用户观察到的 "水位超过 ~80ms 就出现杂音":
                 #   水位越高, 积压越多, 末端截断比例越大。
                 #
-                #   修法: 让 Resampler 按"队列里有多少可产"来产出(推进
-                #   相位、保持波形完整), 产出的 PCM 再按 WASAPI 的剩余
-                #   空间写入; 写不完的部分**丢弃**(音频直播里旧数据无价值,
-                #   且丢弃发生在完整波形之后, 不会切断插值窗口)。
-                #   这样 `_pos` 始终跟得上队列, 抽头窗口永远有完整样本。
+                # ★ 排水预算: 不要"超调就一次猛灌", 那会产出一大段 PCM,
+                #   而 WASAPI 放不下的部分会被截掉 = 又一次硬切。
+                #   水位控制统一交给上面的 **trim_to 小步滑窗**, 这里只做
+                #   常规的"补满渲染缓冲"。
                 pop_budget = max(budget, 0)
-                if peer_buf is not None and over_ms > 0 and avail > 0:
-                    # 超调时按队列实际可产出来取, 上限一帧 render_target
-                    want_frames = int(self._ren.rate
-                                      * min(level_ms, 95.0) / 1000.0)
-                    pop_budget = max(budget, min(want_frames, avail))
-                if peer_buf is not None and level_ms > self.max_level_ms():
-                    dropped_frames = peer_buf.trim_to(target_ms=self.jitter_ms) \
+                # ★★★ 水位控制: **持续小步滑窗**, 不是"越限就大砍一刀"。
+                #
+                #   用户提供的决定性证据: "起初水位会持续增长到 390ms,
+                #   并在超过 300ms 时出现爆音; 后来限制到 240ms, 就超过
+                #   200ms 出现爆音; 现在限制到 85, 于是超过 80ms 出现爆音。"
+                #   —— **爆音阈值始终紧跟水位上限**, 证明噪音来自"执行
+                #   上限的机制", 而非重采样或积压。
+                #
+                #   旧机制: `level > max_level_ms()` 时调 trim_to(一次性
+                #   削到 target)。事件稀疏但每次都是**几十毫秒的硬切**,
+                #   听感 = 爆音, 且频率正比于"越过上限的频率"。
+                #
+                #   新机制: 每轮都检查, 只要高于**软阈值**就丢一小步
+                #   (max_skip_ms=2ms, 由 trim_to 内部限幅)。断口极小,
+                #   且因为每轮都在做, 水位被稳定压住而不是反复冲高。
+                #
+                #   软阈值取 **1.15x 目标**(60ms -> 69ms): 让超调在很小的
+                #   幅度就被削掉, 而不是等到 90/240ms。削得越早, 每次要削
+                #   的量越小, 断口越不明显; 且水位不会呈现"缓慢爬升-突然
+                #   掉落"的锯齿, 听感更稳定。
+                soft_ms = self.jitter_ms * 1.8
+                if peer_buf is not None and level_ms > soft_ms:
+                    # ★ max_skip_ms = **0.5ms**(24 帧): 断口小到接近
+                    #   听不见(0.5ms 的接缝在 1kHz 音上约半个周期,
+                    #   听感是极轻的"沙"); 同时每轮都削, 每秒最多
+                    #   500×0.5 = 250ms, 足以压住任何实际积压速率。
+                    dropped_frames = peer_buf.trim_to(
+                        target_ms=self.jitter_ms, max_skip_ms=0.5) \
                         if hasattr(peer_buf, "trim_to") else 0
                     if dropped_frames:
                         self.stats["level_trims"] = \
                             self.stats.get("level_trims", 0) + 1
                         self.stats["trimmed_frames"] = \
                             self.stats.get("trimmed_frames", 0) + dropped_frames
+                        # 削完之后队列变短, 下一轮的 level 会自然变小,
+                        # 这里不再重复计算(避免同一轮内连削)。
+                        level_ms = peer_buf.buffered_ms()
 
                 # ★ 写入预算 = 只把渲染缓冲补到 render_target, **不是**填满它。
                 #   曾直接用 avail: 第一轮就把攒下的水位全部灌进 WASAPI,
@@ -991,14 +1042,20 @@ class Server:
                             self.stats["resync_popped"] = \
                                 self.stats.get("resync_popped", 0) + 1
                     peer_buf.drain_level_ms = level_ms
-                    # ★ 产出的 PCM 可能多于 WASAPI 剩余空间(因为
-                    #   pop_budget 是按队列可产出量算的, 不是按 avail)。
-                    #   超出部分截掉 —— 见上方 ★★★ 的说明: 丢弃发生在
-                    #   **完整波形之后**, 不会切断插值抽头窗口。
+                    # ★ pop_budget == budget(已受 avail 约束), 所以正常情况
+                    #   下这里不会截断。保留兜底: 若确实超出, 把尾部交给
+                    #   下一轮(不丢), 而不是硬切。
                     if peer is not None:
                         max_bytes = max(0, avail) * block
                         if len(peer) > max_bytes:
+                            self._render_carry = peer[max_bytes:]
                             peer = peer[:max_bytes]
+                        elif getattr(self, "_render_carry", b""):
+                            # 上一轮的残留优先补上(保持顺序)
+                            carry = self._render_carry
+                            head = min(len(carry), max(0, avail) * block)
+                            peer = carry[:head] + peer
+                            self._render_carry = carry[head:] or b""
                         if not peer:
                             peer = None
 

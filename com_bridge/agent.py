@@ -345,24 +345,119 @@ class Agent:
         while not self._stop.is_set():
             r = cap.read(timeout_s=0.2)
             if r is None:
+                # ★★★ 静音时 WASAPI **不返回任何包**(实测: read 全是 None)。
+                #   若此时什么都不发, 主机的音频时间轴就出现**空洞** ——
+                #   主机的 `pop_aligned` 按时间戳取数据, 它看到的下一包
+                #   时间戳突然跳到很远的将来, 于是把这段当成"巨大滞后",
+                #   触发重复/跳过样本 -> 可听杂音; 而且水位在静音期间
+                #   掉到 0, 恢复有声时又要重新攒 -> 每次静音后都有一下响。
+                #
+                #   修法: 静音期间**主动补发全零包**, 保持时间轴连续。
+                #   只在"确实静音"时补(连续多次 read 超时), 且带正确的
+                #   QPC 时间戳, 让主机的队列看到连续的流。
+                self._silence_ticks = getattr(self, "_silence_ticks", 0) + 1
+                if self._silence_ticks >= 2:
+                    # 补一个静音包, 同样按 MTU 上限(120 帧, 不分片)
+                    n_frames = 120
+                    silent = b"\x00" * (n_frames * cap.block_align)
+                    # ★ 时间戳必须**接在上一包之后**(严格递增),
+                    #   不能用 now_us() —— 那可能与上一包乱序, 而主机侧
+                    #   pop_aligned 依赖时间戳单调, 乱序会被当成"滞后"。
+                    dur_us = int(n_frames * 1_000_000 / cap.rate)
+                    last = getattr(self, "_last_audio_ts", 0)
+                    if last:
+                        ts = last + dur_us
+                    else:
+                        ts = now_us()
+                        if clock is not None and clock.synced:
+                            ts = clock.local_to_remote(ts)
+                    self._last_audio_ts = ts
+                    self._audio_tx.send(
+                        silent,
+                        rate=cap.rate,
+                        bits=cap.bits,
+                        channels=cap.channels,
+                        chan_mask=0x3,
+                        ts_us=ts,
+                    )
+                    self.stats["silence_sent"] = \
+                        self.stats.get("silence_sent", 0) + 1
                 continue
-            pcm, flags, _qpc = r
-            if flags & 0x2:  # SILENT
-                continue
-            # 按 server 时钟域打时间戳
-            ts = now_us()
-            if clock is not None and clock.synced:
-                ts = clock.local_to_remote(ts)
-            self._audio_tx.send(
-                pcm,
-                rate=cap.rate,
-                bits=cap.bits,
-                channels=cap.channels,
-                chan_mask=0x3,
-                ts_us=ts,
-            )
-            self.stats["frames_sent"] += 1
+            self._silence_ticks = 0
+            pcm, flags, qpc = r
+            # ★★★ 静音包**必须照发**, 不能丢(2026-10-19 修正)。
+            #
+            #   旧实现 `if flags & 0x2: continue` 把静音包直接扔掉。
+            #   后果: 音频的**时间轴出现空洞** —— 主机的 `pop_aligned`
+            #   按时间戳取数据, 它看到的"下一包"突然跳到很远之后,
+            #   于是把多出来的时间全当成"该跳过的滞后", 触发重复/跳过
+            #   样本 -> 可听杂音。而且静音期间水位会掉到 0, 恢复有声时
+            #   又要重新攒 —— 表现为"每次静音后都有一下爆音"。
+            #   静音包是**合法的音频内容**(全零), 必须按原样发送,
+            #   时间轴才连续。
+            #
+            # ★★★ 时间戳必须用 **QPC 设备位置**(2026-10-19 修正)。
+            #
+            #   旧实现用 `now_us()` —— 那是"读到数据的时刻", 与音频真正
+            #   被采集的时刻之间隔着不确定的延迟(WASAPI 缓冲、调度)。
+            #   这个抖动会让主机的 `pop_aligned` 的 horizon 计算偏移,
+            #   进而重复或跳过样本 -> 杂音。
+            #   `qpc` 是 WASAPI 给的**设备时钟位置**(100ns 单位), 它
+            #   严格按采样率线性推进, 是真正的时间轴基准。
+            if qpc and qpc > 0:
+                # qpc 单位 100ns -> us
+                ts = int(qpc) // 10
+                # 转到主机时钟域(两边设备时钟可能有偏移, 由 clock 校正)
+                if clock is not None and clock.synced:
+                    ts = clock.local_to_remote(ts)
+            else:
+                ts = now_us()
+                if clock is not None and clock.synced:
+                    ts = clock.local_to_remote(ts)
+            # ★★★ 按 MTU 分包发送(2026-10-19 关键修正)。
+            #
+            #   根因: 一包 480 帧 x 2ch x 32bit = **3840 字节**,
+            #   加 IP(20)+UDP(8) = **3868 字节**, 而以太网 MTU 只有 1500
+            #   -> 每个音频包被切成 **3 个 IP 分片**。
+            #   UDP 无重传, **任一分片丢失 -> 整个数据报被丢弃**
+            #   -> 10ms 音频完全消失, 贴包率被放大 ~3 倍,
+            #   听感正是"零碎杂音/爆音"。
+            #
+            #   修复: 每包最多 SEND_FRAMES(120 帧 = 960 字节,
+            #   加头 988 < 1500, **不分片**)。每包带精确递增时间戳,
+            #   主机侧时间轴完全不受影响。
+            #
+            #   为什么是 120 帧: 48kHz 下 = 2.5ms, 网络包数量增到 4 倍,
+            #   但换来"零分片"; 局域网带宽完全够(每声道 ~1.5Mbps)。
+            #   权衡: 包更小 -> 单包丢失影响更短(2.5ms vs 10ms) -> 更不易听出。
+            SEND_FRAMES = 120
+            per = SEND_FRAMES * cap.block_align
+            total_frames = len(pcm) // cap.block_align
+            sent = 0
+            base_ts = ts
+            while sent < total_frames:
+                n = min(SEND_FRAMES, total_frames - sent)
+                piece = pcm[sent * cap.block_align:
+                            (sent + n) * cap.block_align]
+                # 每片的时间戳按帧偏移推进(微秒)
+                piece_ts = base_ts + int(sent * 1_000_000 / cap.rate)
+                self._audio_tx.send(
+                    piece,
+                    rate=cap.rate,
+                    bits=cap.bits,
+                    channels=cap.channels,
+                    chan_mask=0x3,
+                    ts_us=piece_ts,
+                )
+                sent += n
+            # ★ 记录本块**末包**时间戳, 供静音补包接续(严格递增)
+            self._last_audio_ts = base_ts + int(
+                total_frames * 1_000_000 / cap.rate)
+            self.stats["frames_sent"] += total_frames
             self.stats["bytes_sent"] += len(pcm)
+            self.stats["packets_split"] = \
+                self.stats.get("packets_split", 0) + \
+                ((total_frames + SEND_FRAMES - 1) // SEND_FRAMES)
         cap.stop()
 
     def _tone_loop(self, cap, clock) -> None:

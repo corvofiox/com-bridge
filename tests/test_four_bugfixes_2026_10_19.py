@@ -146,15 +146,33 @@ def test_tick_guard_does_not_block_reopen():
 
 # --- BUG D: 水位软阈值 ------------------------------------------------
 
-def test_soft_threshold_drains_watermark():
-    """★ 超过 1.5x 目标就必须加速排水(不等撞到 240ms)。"""
+def test_watermark_control_is_smooth_sliding():
+    """★★★ 水位控制必须是"每轮小步滑窗", 不是"越限就大砍一刀"。
+
+    用户证据: 爆音阈值始终紧跟水位上限(300/200/80ms)
+    -> 噪音来自执行上限的机制本身(一次性丢弃 = 硬切 = 爆音)。
+
+    新机制有两层:
+      a) **比例项 P**: 水位超过目标 -> ratio 略增 -> 重采样器多消费,
+         完全不丢样本(最快无感);
+      b) **小步 trim**: 仍超软阈值时, 每轮最多丢 2ms(断口极小)。
+    不再有"budget 叠加超调量一次猛灌"的机制(那会产出一大段 PCM,
+    WASAPI 放不下的部分被截掉 = 又一次硬切)。
+    """
     src = inspect.getsource(srv_mod.Server._render_loop)
-    assert "over_ms" in src, "必须计算超调量"
-    assert "1.5" in src, "软阈值应为 1.5x 目标"
-    # 预算必须叠加超调量
-    assert "over_ms" in src.split("budget =")[-1] or "over_ms" in src
-    # 超调量要有上限, 防一次排出巨量
-    assert "95.0" in src, "超调量必须 clamp(防止写入超时)"
+    # a) 比例项 —— 用**真实 WASAPI** 实测有效:
+    #    供给快 2% 时 ratio=1.008 把水位峰值从 55ms 压到 20ms 且零丢弃
+    #    (tools/verify_ratio_real_wasapi.py)。
+    #    机制: pop_aligned 的 input_budget = max_frames × ratio,
+    #    ratio 变大 -> 队列真正多被取出, 而产出帧数不变 -> 水位下降。
+    assert "RATIO_P_MAX" in src, "必须有比例项让重采样器先行消化"
+    assert "over" in src, "比例项应随超调程度增长"
+    # b) 小步滑窗作为**兜底**(阈值放宽到 1.8x, 日常由比例项负责)
+    assert "max_skip_ms" in src, "trim 必须限幅(小步)"
+    assert "1.8" in src, "兜底阈值应为 1.8x 目标"
+    # 不应再有"叠加超调量猛灌预算"
+    assert "over_ms" not in src, (
+        "不得再用 over_ms 叠加预算(会一次猛灌再截断)")
 
 
 def test_hard_guard_still_present():

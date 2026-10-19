@@ -111,11 +111,26 @@ class LoopbackCapture:
         self.block_align = fmt.nBlockAlign
 
         zero = GUID("{00000000-0000-0000-0000-000000000000}")
+        # ★★★ 只用 LOOPBACK, **不加** AUTOCONVERTPCM / SRC_DEFAULT_QUALITY
+        #   (2026-10-19 关键修正, 这是"音频有杂音"的真凶之一)。
+        #
+        #   这两个标志会让 WASAPI 用**默认质量的采样率转换器**处理音频:
+        #       AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM  (0x80000000)
+        #       AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY (0x08000000)
+        #   实测后果(等间隔脉冲串测试, tools/diagnose_capture_fidelity.py):
+        #       * 脉冲间隔完美(0.00ms 误差) -> 时间轴没错
+        #       * 但**主频偏移**: 源 2016Hz -> 采集 1992Hz (−1.2%)
+        #       * 频谱形状相关只有 0.597(接近 1 才算一致)
+        #   即: 波形被那个"默认质量"重采样器**改变了**。
+        #   对单频正弦听不出大问题(只是音调略低), 但对音乐这种宽带信号,
+        #   它的插值误差就是**持续的沙沙声** —— 正是用户反复报的杂音。
+        #
+        #   为什么根本不需要它: 我们传入的 `mix` 就是设备的**原生混音格式**
+        #   (GetMixFormat), 采集端与设备格式天然一致, 不存在"需要转换"的
+        #   情况。加了它反而凭空引入一次劣质重采样。
         ac.Initialize(
             AUDCLNT_SHARED,
-            AUDCLNT_STREAMFLAGS_LOOPBACK
-            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+            AUDCLNT_STREAMFLAGS_LOOPBACK,
             0, 0, mix, zero,
         )
         self.buffer_frames = ac.GetBufferSize()
@@ -797,29 +812,53 @@ class AlignedStreamBuffer:
         self.frames_out += len(merged) // self.block_align
         return merged
 
-    def trim_to(self, target_ms: float) -> int:
-        """主动弃帧: 把水位削回 target_ms, 返回丢弃的帧数。
+    def trim_to(self, target_ms: float, max_skip_ms: float = 2.0) -> int:
+        """把水位削回目标值的**平滑滑窗**(每次最多跳过约 max_skip_ms)。
 
-        ★ 与 push() 里的被动丢弃的区别(这决定了听感):
-          push() 的丢弃是**按包**丢, 且丢在最老的一端 —— 当水位触到
-          max_ms 时它已经在持续丢包, 每一次都在数据流中间切一刀,
-          听感是"突然一段杂音/卡顿"(用户实测的周期杂音特征之一)。
-          本方法由**上层按需调用**, 它在水位达到阈值时**一次性**削
-          一大段, 之后相当长时间都不再触发 —— 把多次小断裂换成
-          一次极短空隙, 听感明显更干净。
+        ★★★ 为什么不能一次性大段丢弃(用户实测的关键证据):
+          用户报告: "起初水位会持续增长到 390ms, 并在超过 300ms 时出现
+          爆音。后来限制它最多涨到 240ms 左右, 然后超过 200ms 出现爆音。
+          现在限制到不超过 85, 于是超过 80ms 出现爆音。"
+          —— **爆音阈值始终紧跟水位上限**。这证明噪音**来自执行水位
+          上限的机制本身**, 而不是重采样/插值/积压。
 
-        只保留最新的一批数据(丢弃最旧的), 因为音频直播场景下
-        "旧数据"没有价值, 播放它只会让延迟越来越大。
+          旧实现从队首 `popleft()` 整包丢弃, 一次可能削掉几十毫秒音频
+          —— 波形被硬切一刀, 听感就是爆音/咔哒。触发频率 = 水位越上限
+          的频率, 所以阈值总跟着上限走。
+
+        ★ 新做法: 每次只丢 **max_skip_ms 以内**的量(默认 2ms ≈ 1~2 个包),
+          由渲染循环**每轮调用一次**。这样:
+            * 每次的波形断裂极小(2ms 的接缝, 听感接近无缝);
+            * 削水位变成"持续小步滑动", 而不是"很久一次大跳";
+            * 仍然能保证水位不越过上限(每轮削 2ms, 而每轮只播 2ms,
+              净效果足以把多出的部分追回来)。
+
+        ★ 为什么这样能真正压住水位: 渲染循环每秒约 500 轮, 每轮最多削
+          2ms -> 理论上限削 1000ms/s, 远大于任何实际积压速率。
+          即使每轮只触发一小部分, 也足以稳定。
         """
         keep_frames = int(self.rate * target_ms / 1000)
+        cap_frames = max(1, int(self.rate * max_skip_ms / 1000))
         with self._lock:
             total = self._buffered_frames()
             if total <= keep_frames:
                 return 0
+            # ★ 关键: 本轮**最多**丢 cap_frames, 绝不一次削到底。
+            excess = total - keep_frames
+            budget = min(excess, cap_frames)
             dropped = 0
-            while self._buf and self._buffered_frames() > keep_frames:
-                pcm = self._buf.popleft()[1]
-                dropped += len(pcm) // self.block_align
+            while self._buf and dropped < budget:
+                ts, pcm = self._buf[0]
+                n = len(pcm) // self.block_align
+                want = budget - dropped
+                if n > want:
+                    # 只消费这个包的前 want 帧, 剩余留在队首(相位连续)
+                    keep = want * self.block_align
+                    self._buf[0] = (ts, pcm[keep:])
+                    dropped += want
+                    break
+                self._buf.popleft()
+                dropped += n
             self.dropped += dropped
             return dropped
 

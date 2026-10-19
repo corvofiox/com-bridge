@@ -60,21 +60,53 @@ def test_level_hard_guard_exists():
     assert "0.6" in src, "阈值必须低于 max_ms, 否则触顶后才救"
 
 
-def test_trim_to_exists_and_shrinks():
-    """trim_to 必须真的把水位削到目标。"""
+def test_trim_to_is_bounded_per_call():
+    """★★★ trim_to 每次调用**必须限量**, 不能一次削到底。
+
+    用户提供的决定性证据: "起初水位会持续增长到 390ms, 并在超过 300ms
+    时出现爆音。后来限制它最多涨到 240ms, 然后超过 200ms 出现爆音。
+    现在限制到不超过 85, 于是超过 80ms 出现爆音。"
+    —— **爆音阈值始终紧跟水位上限**, 说明噪音来自"执行上限的机制"。
+
+    旧实现一次 popleft 到底(几十毫秒硬切) -> 每次都是一次爆音。
+    新实现每次最多丢 max_skip_ms(默认 2ms), 由渲染循环每轮调用,
+    断口极小, 且持续小步压住水位。
+    """
     assert hasattr(audio_mod.AlignedStreamBuffer, "trim_to")
     buf = audio_mod.AlignedStreamBuffer(
         channels=2, block_align=8, bits=32, rate=48000,
         name="t", target_ms=60.0, max_ms=10000.0)
     pcm = b"\x00" * (480 * 8)
-    for _ in range(10):          # 100ms
+    for _ in range(30):          # 300ms
         buf.push(0, pcm)
     before = buf.buffered_ms()
-    dropped = buf.trim_to(60.0)
+    dropped = buf.trim_to(60.0, max_skip_ms=2.0)
     after = buf.buffered_ms()
     assert dropped > 0, "应当丢弃了一些帧"
-    assert after <= before, "水位应当下降"
-    assert after <= 70.0, f"应削到约 60ms, 实际 {after}"
+    assert after < before, "水位应当下降"
+    # ★ 核心断言: 单次丢弃量受限(2ms ≈ 96 帧), 不能是"削到 60ms"
+    assert dropped <= 48 * 2 + 8, (
+        f"单次丢弃 {dropped} 帧超过 2ms 上限 —— 会硬切产生爆音"
+    )
+    assert after > 100, (
+        f"单次调用后水位应仍然较高(逐步下滑), 实际 {after}ms "
+        f"— 一次削到底就是旧 bug")
+
+
+def test_trim_to_repeated_calls_converge():
+    """多次调用应逐步把水位压到目标附近(而不是永远压不下来)。"""
+    buf = audio_mod.AlignedStreamBuffer(
+        channels=2, block_align=8, bits=32, rate=48000,
+        name="t2", target_ms=60.0, max_ms=10000.0)
+    pcm = b"\x00" * (480 * 8)
+    for _ in range(30):          # 300ms
+        buf.push(0, pcm)
+    for _ in range(200):         # 足够多轮(渲染循环每秒数百轮)
+        buf.trim_to(60.0, max_skip_ms=2.0)
+        if buf.buffered_ms() <= 61.0:
+            break
+    assert buf.buffered_ms() <= 62.0, (
+        f"多轮后水位应接近目标, 实际 {buf.buffered_ms():.1f}ms")
 
 
 def test_resampler_backlog_guard():
