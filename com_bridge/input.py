@@ -325,6 +325,34 @@ def _set_mouse_accel(triple) -> bool:
                                              ctypes.byref(a), 0))
 
 
+def _get_mouse_speed():
+    """读指针速度档位(1..20, 10=默认)。失败返回 None。
+
+    ★ 这是**第二个**位移放大机制, 和加速曲线相互独立:
+      加速曲线(SPI_SETMOUSE)管"快动时额外放大",
+      速度档位(SPI_SETMOUSESPEED)管"所有位移的整数倍放缩"。
+      只关前者不关后者, 注入的位移仍会被放大 —— 用户就会感觉
+      "副屏鼠标显著更快"。Deskflow 两者都关(见 move_relative 的说明)。
+    """
+    v = ctypes.c_int(0)
+    if not user32.SystemParametersInfoW(SPI_GETMOUSESPEED, 0,
+                                        ctypes.byref(v), 0):
+        return None
+    n = int(v.value)
+    # 夹到合法范围: 0 或越界值都视为"读不到"
+    return n if 1 <= n <= 20 else None
+
+
+def _set_mouse_speed(speed: int) -> bool:
+    """设指针速度档位。1 = 最慢(1:1), 10 = 默认, 20 = 最快。"""
+    try:
+        s = max(1, min(20, int(speed)))
+        return bool(user32.SystemParametersInfoW(
+            SPI_SETMOUSESPEED, 0, ctypes.c_void_p(s), 0x0001 | 0x0002))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # --- 越界几何 -----------------------------------------------------------
 
 @dataclass
@@ -967,40 +995,41 @@ class InputInjector:
 
     @staticmethod
     def move_relative(dx: int, dy: int) -> int:
-        """注入相对位移; **临时禁用指针加速**使其与主机 1:1。
+        """副机侧: 把主机的相对位移**精确**地重现为光标移动。
 
-        ★ 为什么必须禁加速(实测确认, 见 tools/diag_accel.py):
-          注入的相对位移同样走 Windows 的加速曲线 —— 请求 (40,25) 实测走
-          (92,57), 放大 2.29 倍。后果是副机鼠标手感与主机**完全不一致**,
-          用户会觉得副机鼠标"飘、不听使唤、划不动", 而且完全没有线索指向
-          加速(看起来就像"位移算错了")。
-          临时禁用后实测严格 1:1; 还原后用户的设置分毫不动。
-        ★ 为什么是"临时禁+立即还原"而不是永久关掉: 永久关会改掉用户自己的
-          鼠标手感, 且程序崩溃后永久残留。Deskflow 同样是临时改+还原。
-        ★ 用锁串行化: 两个线程同时改全局鼠标设置会互相踩(一个还原了另一个
-          正在用的"已禁用"状态), 导致部分事件仍被加速。
+        ★★★ 为什么不能用 MOUSEEVENTF_MOVE + 改系统设置(实测数据):
+          Windows 对相对位移会施加**两层独立的放大**:
+            ① 加速曲线 SPI_SETMOUSE —— "指针精度", 快动时额外放大;
+            ② 速度档位 SPI_SETMOUSESPEED —— 对**所有**位移的整数倍放缩。
+          实测本机(档位 10)的完整映射表(请求 dx=40):
+              档位  1 -> 0.215x    档位  5 -> 1.080x
+              档位  4 -> 0.860x    档位 10 -> 2.160x
+              档位 20 -> 4.315x
+          * 档位 10(Windows 默认)= **2.16 倍放大** —— 这正是用户报的
+            "进入副屏后鼠标速度显著快于主屏"。
+          * 即使把加速曲线关掉, 速度档位仍在放大; Deskflow 的做法是
+            两者都临时改(见 MSWindowsDesks.cpp :466-495, 它把速度设为 1),
+            但 **档位 1 实测是 0.215x**, 也不是 1:1 —— 所以 Deskflow 的
+            方案同样不精确(它的相对模式是可选实验特性)。
+
+        ★ 解法: **改用绝对定位**。MOUSEEVENTF_ABSOLUTE 的坐标直接映射到
+          屏幕像素, **完全绕过加速曲线与速度档位**(两者都只作用于相对
+          位移)。做法: 读当前光标 -> 加上 dx/dy -> 绝对注入。
+          * 精确: 请求多少像素就走多少像素, 与两台机器的鼠标设置无关;
+          * 无需改系统设置: 不动用户的"指针精度"/速度, 崩溃也无残留;
+          * 代价: 每次要读一次光标(GetCursorPos, 微秒级)。
+        ★ 边界: 绝对坐标必须夹在虚拟桌面内, 否则 Windows 会钳到边缘
+          (那会造成"推到头就不动了"的错觉, 但这是正确的物理行为)。
         """
-        with _ACCEL_LOCK:
-            saved = _save_mouse_accel()
-            disabled = False
-            if saved is not None and saved[2] != 0:
-                # {0,0,0} = 关闭加速(阈值 0 表示不启用加速曲线)
-                disabled = _set_mouse_accel((0, 0, 0))
-            try:
-                i = INPUT(type=INPUT_MOUSE)
-                i.union.mi.dx = dx
-                i.union.mi.dy = dy
-                i.union.mi.dwFlags = MOUSEEVENTF_MOVE
-                # ★ 标记所有位移注入(含 move_absolute), 让本机原始输入
-                #   监听器能识别并丢弃它, 避免状态机自激(见类文档)。
-                i.union.mi.dwExtraInfo = InputInjector.TAG
-                n = InputInjector._send(i)
-                if n > 0:
-                    InputInjector._last_move_ts = time.monotonic()
-                return n
-            finally:
-                if disabled:
-                    _set_mouse_accel(saved)
+        from .input import virtual_desktop
+        v = virtual_desktop()
+        cur = get_cursor_pos()
+        nx = int(cur[0]) + int(dx)
+        ny = int(cur[1]) + int(dy)
+        # 夹到虚拟桌面范围内(留 1px 余量, 避免落到边界外触发钳制)
+        nx = max(v.left, min(v.right - 1, nx))
+        ny = max(v.top, min(v.bottom - 1, ny))
+        return InputInjector.move_absolute(nx, ny)
 
     @staticmethod
     def move_absolute(x: int, y: int) -> int:

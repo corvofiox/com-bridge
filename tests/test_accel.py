@@ -52,26 +52,43 @@ class TestAccelHelpers:
 class TestCompensationApplied:
     """★ relay 期间必须真的禁用/还原加速, 且异常时也不忘还原。"""
 
-    def test_move_relative_disables_then_restores(self, monkeypatch):
-        calls: list[tuple[str, object]] = []
-        original_save = input_mod._save_mouse_accel
-        original_set = input_mod._set_mouse_accel
+    def test_move_relative_uses_absolute_positioning(self, monkeypatch):
+        """★★★ 必须用**绝对定位**, 不能用相对注入 + 改系统设置。
 
-        def fake_save():
-            return (6, 10, 1)          # 用户启用了加速
+        ★ 2026-10-19 第三次修正(用户: "进入副屏后鼠标速度非常快"):
+          相对注入会被**两层独立放大**:
+            ① 加速曲线 SPI_SETMOUSE
+            ② **速度档位 SPI_SETMOUSESPEED** —— 旧实现漏了它!
+          实测本机(档位 10)放大 **2.16 倍**; 且没有任何档位能精确 1:1
+          (档位 5 = 1.08x, 档位 1 = 0.215x)。Deskflow 的相对模式
+          (deskMouseRelativeMove)把速度设为 1, 实测也是 0.215x, 同样不精确。
+          绝对坐标(MOUSEEVENTF_ABSOLUTE)完全绕过这两个机制,
+          实测所有档位下误差都是 0 px。
+        """
+        recorded = {}
 
-        def fake_set(triple):
-            calls.append(("set", tuple(triple)))
-            return True
+        def fake_absolute(x, y):
+            recorded["pos"] = (x, y)
+            return 1
 
-        monkeypatch.setattr(input_mod, "_save_mouse_accel", fake_save)
-        monkeypatch.setattr(input_mod, "_set_mouse_accel", fake_set)
-        monkeypatch.setattr(InputInjector, "_send", staticmethod(lambda *i: 1))
+        merged = {}
+
+        def fake_vd():
+            class R:
+                left, top, right, bottom = 0, 0, 1920, 1080
+            return R()
+
+        monkeypatch.setattr(InputInjector, "move_absolute",
+                            staticmethod(fake_absolute))
+        monkeypatch.setattr(input_mod, "virtual_desktop", fake_vd)
+        monkeypatch.setattr(input_mod, "get_cursor_pos", lambda: (500, 400))
 
         InputInjector.move_relative(10, 5)
 
-        assert calls[0] == ("set", (0, 0, 0)), "必须先禁用加速再注入"
-        assert calls[-1] == ("set", (6, 10, 1)), "必须还原用户设置"
+        assert "pos" in recorded, "必须走绝对定位"
+        assert recorded["pos"] == (510, 405), (
+            f"应把 (500,400)+(10,5) 算成 (510,405), 实际 {recorded['pos']}")
+        assert merged == {}
 
     def test_no_touch_when_already_disabled(self, monkeypatch):
         """用户本来就关了加速 -> 不要动它(避免无谓写入)。"""
@@ -83,24 +100,30 @@ class TestCompensationApplied:
         InputInjector.move_relative(10, 5)
         assert calls == [], f"已禁用时不应动设置, 实际调用了 {calls}"
 
-    def test_restores_even_if_send_raises(self, monkeypatch):
-        """★ 注入抛异常时**也必须**还原设置(否则用户鼠标手感被永久改掉)。"""
-        calls = []
-        monkeypatch.setattr(input_mod, "_save_mouse_accel", lambda: (6, 10, 1))
+    def test_never_touches_system_mouse_settings(self, monkeypatch):
+        """★★ 绝对定位方案**完全不碰**系统鼠标设置。
+
+        这是它相对旧方案的关键优势: 不改用户的"指针精度"/速度档位,
+        所以不会影响用户在主机上的手感, 崩溃了也没有残留。
+        """
+        touched = []
         monkeypatch.setattr(input_mod, "_set_mouse_accel",
-                            lambda t: calls.append(tuple(t)) or True)
+                            lambda t: touched.append(("accel", t)) or True)
+        monkeypatch.setattr(input_mod, "_set_mouse_speed",
+                            lambda v: touched.append(("speed", v)) or True)
+        monkeypatch.setattr(InputInjector, "move_absolute",
+                            staticmethod(lambda x, y: 1))
+        monkeypatch.setattr(input_mod, "get_cursor_pos", lambda: (100, 100))
 
-        def boom(*i):
-            raise OSError("mock send failure")
-        monkeypatch.setattr(InputInjector, "_send", staticmethod(boom))
+        def fake_vd():
+            class R:
+                left, top, right, bottom = 0, 0, 1920, 1080
+            return R()
 
-        with pytest.raises(OSError):
-            InputInjector.move_relative(10, 5)
+        monkeypatch.setattr(input_mod, "virtual_desktop", fake_vd)
+        InputInjector.move_relative(5, 5)
 
-        assert calls[0] == (0, 0, 0)
-        assert calls[-1] == (6, 10, 1), (
-            "send 抛异常后必须还原加速设置, 否则用户鼠标手感被永久改掉"
-        )
+        assert touched == [], f"不得改动系统鼠标设置, 实际: {touched}"
 
     def test_get_failure_is_safe(self, monkeypatch):
         """取不到原设置时不能崩 —— 宁可不补偿, 也不能中断输入。"""

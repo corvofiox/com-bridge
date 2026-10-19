@@ -86,8 +86,10 @@ class TestWiring:
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef) and n.name == "move_relative")
         src = ast.get_source_segment(INPUT_SRC, fn)
-        assert "_last_move_ts = time.monotonic()" in src, \
-            "move_relative 注入成功后必须打点"
+        # ★ 2026-10-19: move_relative 现在委托给 move_absolute(绝对定位),
+        #   打点由 move_absolute 负责。所以这里改为断言"确实委托过去"。
+        assert "move_absolute" in src, \
+            "move_relative 必须委托给 move_absolute(绝对定位方案)"
 
     def test_move_absolute_records_ts(self):
         tree = ast.parse(INPUT_SRC)
@@ -107,7 +109,9 @@ class TestWiring:
                 if "n > 0" in cond or "n != 0" in cond:
                     body = ast.get_source_segment(INPUT_SRC, n.body[0]) or ""
                     hits += "_last_move_ts = time.monotonic()" in body
-        assert hits >= 2, "两条移动路径的打点都应受 n>0 保护"
+        # ★ 现在只有 move_absolute 一条真实注入路径
+        #   (move_relative 委托给它), 所以门槛是 1。
+        assert hits >= 1, "注入路径的打点必须受 n>0 保护"
 
     @staticmethod
     def _strip_comments(src: str) -> str:

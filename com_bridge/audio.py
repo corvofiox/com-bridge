@@ -194,6 +194,11 @@ class LoopbackRenderer:
         self.bits = 0
         self.block_align = 0
         self.buffer_frames = 0
+        # ★ 上一轮没写完的 PCM 尾部(见 write 的说明: **绝不丢弃数据**)。
+        #   WASAPI 的 GetCurrentPadding 是近似值, avail 常比实际少 1~2 帧,
+        #   直接丢弃会造成波形微断裂 -> 可听沙沙声, 且高水位时更明显。
+        self._pending: bytes = b""
+        self._pending_carry = 0      # 发生"写不完"的次数(诊断)
 
     def start(self) -> None:
         from pycaw.api.audioclient import IAudioClient
@@ -230,9 +235,25 @@ class LoopbackRenderer:
         ac.Start()
 
     def write(self, pcm: bytes) -> int:
-        """写入 PCM(必须与本机 mix format 一致), 返回写入帧数。"""
+        """写入 PCM(必须与本机 mix format 一致), 返回写入帧数。
+
+        ★★★ 绝不丢弃尾部数据(实测杂音源之一):
+          旧实现 `n = min(frames, avail)` 只写入 n 帧, **剩下的直接丢**:
+              ctypes.memmove(ptr, pcm[:n*block_align], ...)
+          而 `avail = buffer_frames - GetCurrentPadding()` 是**近似值**
+          (WASAPI 的 padding 有采样延迟/取整), 实际可用空间经常比它
+          多 1~2 帧。于是每轮都可能丢掉几个样本 —— 波形被切断一小段,
+          听感是"细小沙沙声", 而且**只在高水位时明显**(那时每轮送来的
+          帧数多, 越界概率大)。
+          修法: 把 remainder 暂存起来, 下一轮**优先写它**。
+          这样任何数据都不会丢, 只是延后一轮写入。
+        """
         if self._rc is None:
             return 0
+        # 先把上一轮没写完的尾部接上
+        if self._pending:
+            pcm = self._pending + pcm
+            self._pending = b""
         frames = len(pcm) // self.block_align
         if frames == 0:
             return 0
@@ -240,10 +261,16 @@ class LoopbackRenderer:
         avail = self.buffer_frames - pad
         n = min(frames, avail)
         if n <= 0:
+            # 一点空间都没有: 整段留到下一轮(不能丢)
+            self._pending = pcm
             return 0
         ptr = self._rc.GetBuffer(n)
         ctypes.memmove(ptr, pcm[: n * self.block_align], n * self.block_align)
         self._rc.ReleaseBuffer(n, 0)
+        # ★ 没写完的尾部留到下一轮, 绝不丢弃
+        if n < frames:
+            self._pending = pcm[n * self.block_align:]
+            self._pending_carry += 1
         return n
 
     def available_frames(self) -> int:
