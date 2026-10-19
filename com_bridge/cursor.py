@@ -59,9 +59,22 @@ SWP_SHOWWINDOW = 0x0040
 SWP_HIDEWINDOW = 0x0080
 WM_MOUSEMOVE = 0x0200
 WM_CAPTURECHANGED = 0x031D   # 捕获被别的窗口抢走(用户拖拽应用等)
+WM_TIMER = 0x0113
 WM_APP = 0x8000
 MSG_HIDE = WM_APP + 1        # 显示 hider 窗口(= 隐藏光标)
 MSG_SHOW = WM_APP + 2        # 收起 hider 窗口(= 恢复光标)
+
+# ★★★ 保活定时器: hide 存续期间周期验证捕获仍在手上。
+#   用户实测 BUG: "出点在浏览器滚动条/图片查看器下一页等可交互
+#   元素上时, 主机指针进入副机后不消失"。这类窗口响应 hover 时会
+#   自己 SetCapture(滚动条拖拽/悬停跟踪), 我们的 SetCapture 触发
+#   对方 WM_CAPTURECHANGED 后它立刻重抢 —— 单次"被抢再夺回"
+#   追不上持续争抢, 捕获丢失期间鼠标消息流回对方线程, 我们线程
+#   的 ShowCursor 计数器失去效力, 光标现形。
+#   解法: 定时器每 100ms 主动查 GetCapture; 不是自己就立刻重夺,
+#   并再补一次抖动注入(强制提交计数器)。
+KEEPALIVE_TIMER_ID = 1
+KEEPALIVE_MS = 100
 
 TRUE = 1
 FALSE = 0
@@ -150,6 +163,11 @@ class CursorHider:
         self._counter_after_hide = 0
         # show() 时本线程的 ShowCursor 返回值(>=0 = 光标已恢复)
         self._counter_after_show = 0
+        # 诊断: hide 期间 WM_CAPTURECHANGED 的次数。>0 说明有别的窗口
+        # (或系统)在跟我们争鼠标捕获 —— 争抢会中断"本线程接收鼠标输入"
+        # 这一隐藏前提, 光标现形(用户实测: 出点在滚动条/按钮等可交互
+        # 元素上时主机指针不消失)。
+        self._capture_changed = 0
         self._class_name = f"ComBridgeHider_{id(self):x}"   # 每实例唯一
 
     # -- 生命周期 ------------------------------------------------------
@@ -249,10 +267,25 @@ class CursorHider:
         if msg == MSG_SHOW:
             self._do_show()
             return 0
+        if msg == WM_TIMER and wparam == KEEPALIVE_TIMER_ID and self._shown:
+            # ★ 保活: 捕获被可交互窗口(滚动条/悬停跟踪)持续争抢时,
+            #   WM_CAPTURECHANGED 只提醒一次, 之后对方仍持有捕获。
+            #   每 100ms 主动查一次: 不是自己就立刻重夺 + 补抖动提交。
+            if user32.GetCapture() != hwnd:
+                self._capture_changed += 1
+                user32.SetCapture(hwnd)
+                self._captured = (user32.GetCapture() == hwnd)
+                if self._captured:
+                    from .input import InputInjector
+                    InputInjector.move_relative(1, 0)
+                    InputInjector.move_relative(-1, 0)
+                    self._hide_mono = time.monotonic()
+            return 0
         if msg == WM_CAPTURECHANGED and self._shown:
             # 捕获被抢走(用户点击拖拽了别的应用): 不重新捕获的话,
             # 按线程的 ShowCursor 计数器和类光标都会**失去效力**, 光标
             # 重新现形。Deskflow 靠前台窗口维持, 我们靠重新捕获。
+            self._capture_changed += 1
             user32.SetCapture(hwnd)
             self._captured = (user32.GetCapture() == hwnd)
             return 0
@@ -417,6 +450,13 @@ class CursorHider:
         self._captured = (user32.GetCapture() == self._hwnd)
         self._counter_after_hide = _set_cursor_visibility(False)
 
+        # ★ 启动保活定时器: 周期重验捕获(见 WM_TIMER 分支)。
+        #   对抗"出点在滚动条/悬停跟踪元素上"时对方的持续重抢。
+        user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t,
+                                    wintypes.UINT, ctypes.c_void_p]
+        user32.SetTimer.restype = ctypes.c_size_t
+        user32.SetTimer(self._hwnd, KEEPALIVE_TIMER_ID, KEEPALIVE_MS, None)
+
         # --- 强制提交(照搬 :644-645) ---
         # "windows can take a while to hide the cursor, so wait a few
         #  milliseconds to ensure the cursor is hidden before centering"
@@ -440,6 +480,10 @@ class CursorHider:
         #   WM_CAPTURECHANGED, 若那时 _shown 仍为 True, 重捕获逻辑会把
         #   捕获抢回来 -> 光标永远隐藏不掉(自己造的死锁)。
         self._shown = False
+        # 停保活定时器(不再需要重验捕获)
+        user32.KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
+        user32.KillTimer.restype = wintypes.BOOL
+        user32.KillTimer(self._hwnd, KEEPALIVE_TIMER_ID)
         user32.ReleaseCapture()
         self._captured = False
         user32.SetWindowPos(self._hwnd, HWND_BOTTOM, 0, 0, 0, 0,

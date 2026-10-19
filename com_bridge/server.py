@@ -901,15 +901,38 @@ class Server:
                 self.stats["ratio_ff"] = round(ratio_ff, 6)
                 self.stats["arrival_rate"] = round(arrival, 1)
 
-                # ★★★ 水位硬保护: 逼近 max_ms 时**主动弃帧**回落到目标。
+                # ★★★ 水位硬保护: 超过软阈值就**加速排水**, 越线更深才弃帧。
                 #   为什么必须要有它(与积分项互补):
                 #     积分项靠调 ratio 慢慢削水位, 时间常数数十秒; 若失配较大
                 #     或偶发突发(agent 补发/系统卡顿), 水位仍可能摸到上限,
                 #     一旦触顶就只能靠 push() 的丢弃(那是被动的、按包丢,
                 #     且丢在数据流中间 → 听感上就是"突然一段杂音/卡顿")。
-                #   主动弃帧的做法: 一次丢掉多出的部分, 丢在**渲染边界**,
-                #   听感上只是一次极短的空隙, 比被动丢包干净得多。
-                #   阈值取 max_ms 的 60%: 留足余量, 正常波动不会触发。
+                #
+                #   ★ 2026-10-19 重做(用户实测: "水位设定 60ms 后依然偶尔
+                #     突破 200ms, 并在破 200ms 时出现零碎杂音, 回落后正常"):
+                #     旧方案(240ms 才一次性 trim 回 60ms)有两个问题:
+                #       a) 阈值太高: 水位在 60~240ms 区间完全没人管, 缓慢
+                #          堆积可以一路爬到 200ms+ 才被砍, 用户全程看得到;
+                #       b) 排水速度不够: budget 被钉死在"补满渲染缓冲",
+                #          高水位只能靠积分项以数十秒的时间常数慢慢削,
+                #          削的过程中每轮渲染间隙的突发反复顶高水位。
+                #     新方案(两段式):
+                #       1. 软阈值(1.5x 目标 = 90ms@60): 超过即在本轮
+                #          budget 上**叠加超调量**(over_ms), 让每一轮都
+                #          多排一点 —— 平滑回落, 无弃帧、无杂音;
+                #          over_ms 上限 clamp 到 render_target(约 95ms),
+                #          避免一次排出巨量导致 WASAPI 写入超时。
+                #       2. 硬阈值(240ms, 保持): 仍保留一次性 trim 兜底,
+                #          处理极端失控(对端突发/时钟异常)。
+                over_ms = level_ms - self.jitter_ms * 1.5
+                if peer_buf is not None and over_ms > 0:
+                    budget = max(0, min(
+                        avail + int(self._ren.rate * min(over_ms, 95.0)
+                                    / 1000.0),
+                        render_target - padding
+                        + int(self._ren.rate * min(over_ms, 95.0) / 1000.0)))
+                else:
+                    budget = max(0, min(avail, render_target - padding))
                 if peer_buf is not None and level_ms > self.max_level_ms():
                     dropped_frames = peer_buf.trim_to(target_ms=self.jitter_ms) \
                         if hasattr(peer_buf, "trim_to") else 0
@@ -930,7 +953,6 @@ class Server:
                 #   重采样器饥饿"并不成立 —— 真正的问题在 Resampler 内部
                 #   对 max_out 的处理(已单独修复, 见 audio.Resampler.process)。
                 #   这里保持原逻辑, 不引入不必要的风险。
-                budget = max(0, min(avail, render_target - padding))
 
                 peer = None
                 if peer_buf is not None and budget > 0:

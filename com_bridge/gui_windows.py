@@ -46,8 +46,18 @@ class _BaseWindow:
                 self.win.focus_force()
             except tk.TclError:
                 pass
+            # ★★★ 重开窗口必须重启刷新定时器(用户实测 BUG:
+            #   "实时状态在运行一段时间后会卡死不再更新")。
+            #   hide() 会取消 tick 链(hide_children), 而 show() 原来
+            #   只做 deiconify —— 定时器一旦取消就永远没人再排,
+            #   窗口重开后界面冻结在旧值。子类实现 on_reopen()
+            #   以恢复自己的循环; 无循环的子类不实现即可。
+            self.on_reopen()
             return
         self._create()
+
+    def on_reopen(self) -> None:
+        """窗口从隐藏中重新显示时恢复刷新循环(子类按需覆盖)。"""
 
     def _create(self) -> None:
         w = tk.Toplevel(self.master)
@@ -183,6 +193,11 @@ class StatusWindow(_BaseWindow):
                 pass
         self._timer = None
 
+    def on_reopen(self) -> None:
+        """重开时重启刷新循环(BUG 修复: hide 取消后无人再排)。"""
+        if self._timer is None:
+            self._tick()
+
     def refresh(self) -> None:
         """从 app 拉取最新状态并刷新显示。"""
         data = self.app.collect_status()
@@ -315,3 +330,8 @@ class LogWindow(_BaseWindow):
             except tk.TclError:
                 pass
         self._timer = None
+
+    def on_reopen(self) -> None:
+        """重开时重启补日志循环(hide 取消后无人再排, 同 StatusWindow)。"""
+        if self._timer is None:
+            self._tick()

@@ -615,10 +615,15 @@ class ComBridgeGui:
         try:
             import ctypes
             user32 = ctypes.windll.user32
-            # 记录顶层 hwnd(监控与恢复都要用)
-            if not getattr(self, "_top_hwnd", 0):
-                hwnd = int(self.root.winfo_id())
-                self._top_hwnd = user32.GetAncestor(hwnd, 2) or hwnd
+            # ★★★ 顶层 hwnd **每次动态解析**, 不缓存!
+            #   实测坑: 首次调用时窗口可能尚未完全成型(或 Tk 应用主题后
+            #   重建了窗口层级), 缓存的 _top_hwnd 会指向**错误窗口** ——
+            #   之后 tick 里 `fg == top` 永远不成立, 焦点监控形同虚设
+            #   (用户实测 BUG: "程序窗口前台时副机键盘同步进主机窗口"
+            #   的隐藏根因之一)。GetAncestor 是纯内核查询, 微秒级,
+            #   每 700ms 一次的成本可以忽略。
+            hwnd = int(self.root.winfo_id())
+            self._top_hwnd = user32.GetAncestor(hwnd, 2) or hwnd
             # ① 把前台交给 shell(桌面/任务栏), 它一定存在且不吞键
             shell = user32.GetShellWindow()
             if shell:
@@ -658,23 +663,42 @@ class ComBridgeGui:
           => 只要窗口抢到前台, 钩子立刻失效。而用户随时会点 GUI 窗口,
           所以必须每 700ms 检查一次并纠正。
 
-        ★★★ 两条**必须跳过**的情形(都是用户实测的回归):
-          1. 窗口最小化 / 不可见 —— 此时它本来就不是前台, 钩子不受影响;
-             若仍去抢前台, 用户点任务栏恢复时会被立刻夺走焦点,
-             表现为"点了没反应/闪一下又没了"。
-          2. 用户刚主动操作过窗口(点击/恢复)之后的**宽限期** ——
+        ★★★ 三条处理规则(前两条是实测回归, 第三条修本次报告的键盘泄漏):
+          1. 窗口最小化 / 不可见 -> 不干预。此时它本来就不是前台; 若仍
+             去抢前台, 用户点任务栏恢复时会被立刻夺走焦点, 表现为
+             "点了没反应/闪一下又没了"。
+          2. 用户刚主动操作过窗口(点击/恢复)之后的**宽限期** -> 不干预,
              用户点开 GUI 是为了用它, 这时强行把焦点交出去等于抢他的操作。
-             宽限期过后再恢复保护。
+          3. ★ 穿越态(control 在副机)时**宽限期让位**(BUG 实测:
+             "程序窗口处于前台时, 副机的键盘输入依然会同步到主机程序
+             的窗口中")。宽限本来只是"让用户点界面", 但 GUI 在前台
+             = 键盘钩子完全失效 = 副机每一次击键都泄漏进主机的 GUI,
+             8 秒宽限等于 8 秒键盘泄漏。穿越态下不等宽限, 立即交还。
+             用户正在副机打字, 不会同时盯着主机 GUI 点按钮,
+             交还不会打断任何操作。
         """
         try:
             import ctypes
             user32 = ctypes.windll.user32
-            top = getattr(self, "_top_hwnd", 0) or int(self.root.winfo_id())
+            # ★ 顶层 hwnd 动态解析(理由见 _release_focus_for_hook):
+            #   缓存值在窗口成型前记录时是错的, 会让 fg==top 恒 False。
+            hwnd = int(self.root.winfo_id())
+            top = user32.GetAncestor(hwnd, 2) or hwnd
+            self._top_hwnd = top
             # ① 最小化 / 不可见 -> 不干预
             if not user32.IsWindowVisible(top) or user32.IsIconic(top):
                 return
-            # ② 用户主动操作后的宽限期 -> 不干预
-            if time.monotonic() < getattr(self, "_focus_grace_until", 0.0):
+            # ②③ 穿越态判定 -> 宽限期是否让位
+            crossing = False
+            role = getattr(self, "_role", None)
+            edge = getattr(role, "_edge", None) if role is not None else None
+            if edge is not None:
+                try:
+                    crossing = bool(edge.is_outside)
+                except Exception:  # noqa: BLE001
+                    crossing = False
+            if (not crossing) and time.monotonic() < \
+                    getattr(self, "_focus_grace_until", 0.0):
                 return
             fg = user32.GetForegroundWindow()
             if fg and fg == top:
@@ -688,6 +712,13 @@ class ComBridgeGui:
                         self._log_q.put_nowait(
                             "[gui] 窗口曾抢到前台 -> 已交还焦点"
                             "(窗口在前台时键盘钩子会失效)")
+                    except queue.Full:
+                        pass
+                elif crossing and n % 10 == 0:
+                    try:
+                        self._log_q.put_nowait(
+                            "[gui] 穿越态下窗口在前台会泄漏副机键盘, "
+                            "已再次交还焦点")
                     except queue.Full:
                         pass
         except Exception:  # noqa: BLE001
