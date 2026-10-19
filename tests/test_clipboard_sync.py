@@ -216,3 +216,79 @@ def test_text_roundtrip_real_clipboard():
     got = cb.sample()
     assert got is not None
     assert got.get(cb.FMT_TEXT) == text.encode("utf-8")
+
+
+# --- 6. 容量上限(踩过 off-by-header 的边界 bug) ----------------------
+
+def test_max_data_and_total_are_separate():
+    """★★★ 数据量上限与 blob 上限必须**分开**定义。
+
+    踩过的 bug: 只用 `MAX_TOTAL` 同时判断两者, 而 blob = 头部 + 数据。
+    于是"刚好 8MB 的数据"编码后变成 8MB+10B -> 被接收端拒绝 ->
+    表现为"8MB 永远传不过去"(实测: 4MB 0.2s 成功, 8MB 等 24s 超时),
+    而 7.99MB 却可以 —— 典型的边界设计缺陷。
+
+    修法: `MAX_DATA` 约束数据本身, `MAX_TOTAL` = MAX_DATA + 头部余量。
+    """
+    assert hasattr(cs, "MAX_DATA"), "必须有独立的数据量上限"
+    assert cs.MAX_TOTAL > cs.MAX_DATA, "blob 上限要容纳编码头"
+    assert cs.MAX_DATA == 8 * 1024 * 1024, "数据上限应为 8MB"
+    # 8MB 数据编码后必须仍然 <= MAX_TOTAL
+    blob = cs._encode({"text": b"x" * cs.MAX_DATA})
+    assert len(blob) <= cs.MAX_TOTAL, (
+        f"8MB 数据编码后 {len(blob)} 超过 MAX_TOTAL {cs.MAX_TOTAL}")
+
+
+def test_8mb_payload_accepted_by_receiver():
+    """★ 8MB 数据的第一个块必须被接收端接受(不能因 total 超限被拒)。"""
+    blob = cs._encode({"text": b"x" * cs.MAX_DATA})
+    chunks = cs.split_payload(1, blob)
+    info = cs.unpack_chunk(chunks[0])
+    assert info is not None, "8MB 内容的 START 块被拒 —— 边界又错了"
+
+
+def test_oversized_rejected():
+    """★ 超过上限的内容必须被拒绝(防止内存/网络被打爆)。"""
+    too_big = cs.MAX_DATA + 1024
+    blob = cs._encode({"text": b"x" * too_big})
+    chunks = cs.split_payload(1, blob)
+    info = cs.unpack_chunk(chunks[0])
+    assert info is None, "超限内容应被拒绝"
+
+
+def test_clipboard_max_matches_sync_max():
+    """★ 采集端与传输端的上限口径必须一致。
+
+    不一致会出现"采集端认为可以、发送端拒绝"(或相反)的怪现象。
+    """
+    assert cb.MAX_PAYLOAD == cs.MAX_DATA, (
+        f"clipboard.MAX_PAYLOAD({cb.MAX_PAYLOAD}) 应等于 "
+        f"clipboard_sync.MAX_DATA({cs.MAX_DATA})")
+
+
+# --- 7. 大内容传输的工程约束 ------------------------------------------
+
+def test_sender_rate_limits():
+    """★★ 发送必须限速。
+
+    实测: 不限速时 8MB 的 8391 个包在 0.2 秒内全塞出去, 接收端 UDP
+    缓冲直接溢出 -> 8MB 必失败。限速后与接收端处理节奏匹配。
+    """
+    from com_bridge.transport import ClipboardSender
+    assert hasattr(ClipboardSender, "MAX_PKT_PER_SEC")
+    src = inspect.getsource(ClipboardSender.send_blob)
+    assert "sleep" in src, "必须有发送限速"
+    assert "YIELD_EVERY" in src or "sleep(0)" in src, "应周期性让出 CPU"
+
+
+def test_receiver_enlarges_buffer():
+    """★★ 接收端必须放大 UDP 缓冲。
+
+    默认 64KB 远不够: 一份 8MB 内容有 8391 个包, 突发到达时缓冲瞬间
+    溢出 -> 整份内容永远凑不齐。
+    """
+    from com_bridge.transport import ClipboardReceiver
+    src = inspect.getsource(ClipboardReceiver.run)
+    assert "SO_RCVBUF" in src, "必须设置接收缓冲"
+    # 至少设到 MB 级
+    assert any(x in src for x in ("4 << 20", "2 << 20", "1 << 20"))

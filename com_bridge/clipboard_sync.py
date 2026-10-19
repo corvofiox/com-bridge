@@ -39,7 +39,15 @@ KIND_END = 3
 #        magic kind  seq   total  offset  chunk  len
 HDR = struct.Struct("<2s B I I I H H")
 CHUNK_SIZE = 1000
-MAX_TOTAL = 8 * 1024 * 1024      # 8MB 上限
+# ★★★ 上限口径(踩过一次 off-by-header 的边界 bug):
+#   `MAX_TOTAL` 约束的是**编码后的 blob 长度**, 而 blob = 头部 + 数据。
+#   所以"刚好 8MB 的数据"编码后会变成 8MB+10 字节 -> 被接收端拒绝,
+#   表现为"8MB 永远传不过去"(实测: 4MB 0.2s 成功, 8MB 等 24s 超时)。
+#   修法: 把数据量上限单独定出来(`MAX_DATA`), 采集侧按数据量判断,
+#   blob 上限则由 MAX_DATA 加上最坏情况的头部开销。
+_MAX_HEADER_COST = 64          # 三格式头部的保守上界(实测 30 字节)
+MAX_DATA = 8 * 1024 * 1024     # 数据(不含编码头)上限: 8MB
+MAX_TOTAL = MAX_DATA + _MAX_HEADER_COST   # blob 上限(给头部留余量)
 
 # 轮询间隔: 剪贴板变化检测很便宜(只读序列号), 但也别太频繁
 POLL_INTERVAL_S = 0.25
@@ -228,8 +236,18 @@ class ClipboardSync:
         payload = cb.sample()
         if not payload:
             return
+        # ★ 按**数据量**判断上限, 不是按编码后的 blob。
+        #   (blob 会多出编码头, 用 blob 判断会让"刚好 8MB"的数据被误拒 ——
+        #    实测 8MB 永远传不过去, 而 7.99MB 可以。)
+        data_bytes = sum(len(v) for v in payload.values())
+        if data_bytes > MAX_DATA:
+            self.stats["skipped_big"] = self.stats.get("skipped_big", 0) + 1
+            return
         blob = _encode(payload)
         if not blob:
+            return
+        if len(blob) > MAX_TOTAL:      # 兜底(理论上不会触发)
+            self.stats["skipped_big"] = self.stats.get("skipped_big", 0) + 1
             return
         h = hashlib.sha1(blob).digest()
         # 与上次发送的内容相同 -> 跳过(用户可能重复复制同一份)
