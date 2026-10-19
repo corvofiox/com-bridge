@@ -1,0 +1,26 @@
+[project]
+name = "com-bridge"
+version = "0.1.0"
+description = "Two-machine Windows KVM (mouse/keyboard across screens) + mixed audio over LAN"
+requires-python = ">=3.10"
+dependencies = [
+    "comtypes>=1.4.8",
+    "pycaw>=20260927",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+com-bridge = "com_bridge.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["com_bridge*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,26 @@
+# Python 运行时产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# PyInstaller 构建中间产物(可由 build_exe.ps1 重新生成)
+build/
+*.spec
+
+# 发布产物(23MB 单文件, 不入库)
+dist/
+
+# 临时调试脚本与日志
+repro*.py
+repro*.log
+*.log
+
+# 本地环境
+.venv/
+venv/
+.env
+
+# IDE
+.idea/
+.vscode/
