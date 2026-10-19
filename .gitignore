@@ -28,3 +28,8 @@ venv/
 # 第三方参考代码(本地克隆的 Deskflow 完整源码)
 tools/deskflow_full/
 
+
+# 测试音频产物
+test_music.npy
+noise_*.wav
+
