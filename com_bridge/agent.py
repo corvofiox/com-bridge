@@ -22,6 +22,8 @@ from .input import (InputInjector, enumerate_monitors, get_cursor_pos,
 from .transport import (
     AudioSender,
     BeaconListener,
+    ClipboardReceiver,
+    ClipboardSender,
     ControlClient,
     InputReceiver,
     InputSender,
@@ -156,6 +158,10 @@ class Agent:
         self._audio_tx: AudioSender | None = None
         self._input_rx: InputReceiver | None = None
         self._control: ControlClient | None = None
+        # 剪贴板跨屏同步(参考 Deskflow, 与 server 侧对称)
+        self._clip_rx = None
+        self._clip_tx: ClipboardSender | None = None
+        self._clip_sync = None
         # 输入回传(光标从本机拖回主电脑): _start_return() 里初始化
         self._return_edge = None
         # 本轮穿越是否已发过回程方位(见 _on_input_event 的"只发一次"说明)
@@ -282,6 +288,10 @@ class Agent:
 
         # 4. 发送/接收线程
         self._audio_tx = AudioSender(host)
+        # ★ 剪贴板跨屏同步(参考 Deskflow, 与 server 侧对称):
+        #   副机复制 -> 发到主机的 CLIPBOARD_PORT;
+        #   主机复制 -> 副机接收并写入本机剪贴板。
+        self._ensure_clipboard(host)
         if self.enable_return:
             # on_heartbeat: 主电脑也可能反向发心跳(它同样可能位于 NAT 后,
             # 例如虚拟机网络)。收到后把**回传**目标切到实际源地址, 保证
@@ -1060,6 +1070,73 @@ class Agent:
         except Exception as exc:  # noqa: BLE001
             print(f"[agent] 发送回程方位失败: {exc}", flush=True)
 
+    # -- 剪贴板跨屏同步(参考 Deskflow, 与 server 侧对称) ----------------
+
+    def _ensure_clipboard(self, host: str) -> None:
+        """启动剪贴板双向同步(幂等)。设计与 server 侧完全一致。
+
+        ★ Deskflow 要点:
+          * 只同步 Text(UTF-8/LF) / HTML / Bitmap(BMP) 三种规范化格式;
+          * 序列号检测变化, 不轮询内容;
+          * 分块传输(按 MTU 切 1000 字节);
+          * 防回环: 自己写进去的不能再发出去。
+        """
+        from .clipboard_sync import ClipboardSync
+        from .transport import ClipboardReceiver, ClipboardSender
+
+        if self._clip_rx is None:
+            try:
+                self._clip_rx = ClipboardReceiver(
+                    on_payload=self._on_clipboard_recv)
+                self._clip_rx.start()
+                print("[agent] 剪贴板接收已启动", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[agent] 剪贴板接收启动失败: {exc}", flush=True)
+                self._clip_rx = None
+
+        if self._clip_tx is None or \
+                getattr(self._clip_tx, "addr", (None,))[0] != host:
+            try:
+                if self._clip_tx is not None:
+                    self._clip_tx.close()
+                self._clip_tx = ClipboardSender(host)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[agent] 剪贴板发送初始化失败: {exc}", flush=True)
+                self._clip_tx = None
+
+        if self._clip_sync is None and self._clip_tx is not None:
+            try:
+                self._clip_sync = ClipboardSync(self._on_local_copy)
+                self._clip_sync.start()
+                print("[agent] 剪贴板同步已启用(双向)", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[agent] 剪贴板同步启动失败: {exc}", flush=True)
+                self._clip_sync = None
+
+    def _on_local_copy(self, blob: bytes, seq: int) -> None:
+        tx = self._clip_tx
+        if tx is None:
+            return
+        if not tx.send_blob(blob, seq):
+            print(f"[agent] 剪贴板发送部分失败"
+                  f"(累计 {tx.failed} 次)", flush=True)
+
+    def _on_clipboard_recv(self, payload: dict) -> None:
+        """收到主机的剪贴板 -> 写进本机(写前登记自写标记防回环)。"""
+        from . import clipboard as cb
+        if not payload:
+            return
+        if self._clip_sync is not None:
+            try:
+                self._clip_sync.note_self_write()
+            except Exception:  # noqa: BLE001
+                pass
+        ok = cb.apply(payload)
+        self.stats["clip_received"] = self.stats.get("clip_received", 0) + 1
+        if not ok:
+            self.stats["clip_apply_failed"] = \
+                self.stats.get("clip_apply_failed", 0) + 1
+
     def _mute_local(self) -> None:
         try:
             from comtypes import CLSCTX_ALL, CoInitialize
@@ -1107,10 +1184,19 @@ class Agent:
             self._hider.show()
             self._hider.stop()
             self._hider = None
+        # 剪贴板资源先停监听器(否则它还在读剪贴板), 再关收发
+        if self._clip_sync is not None:
+            try:
+                self._clip_sync.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._clip_sync = None
         for obj in (self._input_rx, self._audio_tx, self._control,
-                    self._input_tx):
+                    self._input_tx, self._clip_rx, self._clip_tx):
             if obj is not None:
                 obj.stop() if hasattr(obj, "stop") else obj.close()
+        self._clip_rx = None
+        self._clip_tx = None
         if self._cap is not None:
             self._cap.stop()
         if self.mute_local:

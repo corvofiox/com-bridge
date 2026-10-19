@@ -36,6 +36,7 @@ from .input import (
 from .cursor import CursorHider
 from .hook import PASSTHROUGH_VKS, LowLevelHook
 from .protocol import (
+    CLIPBOARD_PORT,
     EV_KEY,
     EV_MOUSE_BUTTON,
     EV_MOUSE_MODS,
@@ -174,6 +175,13 @@ class Server:
         self._audio_rx: AudioReceiver | None = None
         self._input_rx: InputReceiver | None = None
         self._input_tx: InputSender | None = None
+        # 剪贴板跨屏同步(参考 Deskflow 的 Clipboard + ClipboardChunk)。
+        #   _clip_rx: 收对端发来的内容
+        #   _clip_tx: 把本机复制的内容发给对端(地址在 peer 确定后才知道)
+        #   _clip_sync: 监听本机剪贴板变化
+        self._clip_rx = None
+        self._clip_tx: ClipboardSender | None = None
+        self._clip_sync = None
         self._listener: RawInputListener | None = None
         self._edge: EdgeDetector | None = None
         # ★ 必须在 __init__ 预置: _start_input 里 listener 就绪到 hider
@@ -591,6 +599,9 @@ class Server:
         # 反向心跳: 让副电脑也能学到本机的可达地址(同样从接收 socket 发)
         if self._input_rx is not None:
             self._start_rx_heartbeat()
+        # ★ 剪贴板跨屏同步: peer 地址确定后立刻启用(参考 Deskflow)。
+        #   双向: 本机复制 -> 发到 peer; peer 复制 -> 本机接收并写入。
+        self._ensure_clipboard(target[0])
         # 看门狗: 副电脑失联时强制交回控制权(穿越态唯一的自动退出路径)
         if self._input_rx is not None:
             self._start_peer_watchdog()
@@ -635,6 +646,89 @@ class Server:
         t = threading.Thread(target=_loop, daemon=True, name="ServerHeartbeat")
         t.start()
         self._threads.append(t)
+
+    # -- 剪贴板跨屏同步(参考 Deskflow) ---------------------------------
+
+    def _ensure_clipboard(self, peer_host: str) -> None:
+        """启动剪贴板双向同步。幂等 —— 可重复调用。
+
+        ★ 参考 Deskflow 的设计(已读源码):
+          * 只同步 **Text(UTF-8/LF) / HTML / Bitmap(BMP)** 三种规范化格式,
+            各平台自己做本地格式转换(见 clipboard.py)。
+          * 用**序列号**检测变化, 不轮询内容。
+          * 分块传输(ClipboardChunk 的 start/data/end + seq),
+            我们按 MTU 切成 1000 字节的块(见 clipboard_sync.py)。
+          * **防回环**: 自己写进剪贴板的内容不能再发回去,
+            否则两台机器会无限互发同一份内容。
+        """
+        from .clipboard_sync import ClipboardSync
+        from .transport import ClipboardReceiver, ClipboardSender
+
+        # 接收端(收 peer 复制的): 只启一次
+        if self._clip_rx is None:
+            try:
+                self._clip_rx = ClipboardReceiver(
+                    on_payload=self._on_clipboard_recv)
+                self._clip_rx.start()
+                print("[server] 剪贴板接收已启动"
+                      f"(端口 {CLIPBOARD_PORT})", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[server] 剪贴板接收启动失败: {exc}", flush=True)
+                self._clip_rx = None
+
+        # 发送端: peer 地址变了要重建
+        if self._clip_tx is None or \
+                getattr(self._clip_tx, "addr", (None,))[0] != peer_host:
+            try:
+                if self._clip_tx is not None:
+                    self._clip_tx.close()
+                self._clip_tx = ClipboardSender(peer_host)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[server] 剪贴板发送初始化失败: {exc}", flush=True)
+                self._clip_tx = None
+
+        # 本机剪贴板监听: 只启一次
+        if self._clip_sync is None and self._clip_tx is not None:
+            try:
+                self._clip_sync = ClipboardSync(self._on_local_copy)
+                self._clip_sync.start()
+                print("[server] 剪贴板同步已启用(双向)", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[server] 剪贴板同步启动失败: {exc}", flush=True)
+                self._clip_sync = None
+
+    def _on_local_copy(self, blob: bytes, seq: int) -> None:
+        """本机发生"复制" -> 发给 peer。"""
+        tx = self._clip_tx
+        if tx is None:
+            return
+        ok = tx.send_blob(blob, seq)
+        if not ok:
+            print(f"[server] 剪贴板发送部分失败"
+                  f"(累计 {tx.failed} 次)", flush=True)
+
+    def _on_clipboard_recv(self, payload: dict) -> None:
+        """收到 peer 的剪贴板 -> 写进本机。
+
+        ★ 写之前必须**登记自写标记**, 否则我们刚写进去的内容会被
+          本机监听器当成"用户复制"再发回去 -> 两台机器无限互发。
+          这是 Deskflow 用 setClipboard/grabClipboard 解决的问题,
+          我们用一个时间窗实现(见 ClipboardSync.note_self_write)。
+        """
+        from . import clipboard as cb
+        if not payload:
+            return
+        # 先登记(即使 apply 失败也无害: 只是多跳过一轮)
+        if self._clip_sync is not None:
+            try:
+                self._clip_sync.note_self_write()
+            except Exception:  # noqa: BLE001
+                pass
+        ok = cb.apply(payload)
+        self.stats["clip_received"] = self.stats.get("clip_received", 0) + 1
+        if not ok:
+            self.stats["clip_apply_failed"] = \
+                self.stats.get("clip_apply_failed", 0) + 1
 
     def _start_peer_watchdog(self) -> None:
         """★ 心跳丢失看门狗 —— 穿越态唯一的**自动**退出路径。
@@ -1798,14 +1892,23 @@ class Server:
             self._hook = None
         self._show_cursor()
         self._stop_cursor_hider()
+        # ★ 剪贴板资源: 先停监听器(否则它还在读剪贴板), 再关收发
+        if self._clip_sync is not None:
+            try:
+                self._clip_sync.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._clip_sync = None
         for obj in (self._adv, self._ctrl, self._audio_rx, self._input_rx,
-                    self._input_tx):
+                    self._input_tx, self._clip_rx, self._clip_tx):
             if obj is None:
                 continue
             if hasattr(obj, "stop"):
                 obj.stop()
             elif hasattr(obj, "close"):
                 obj.close()
+        self._clip_rx = None
+        self._clip_tx = None
         if self._listener is not None:
             self._listener.stop()
         for obj in (self._cap, self._ren):

@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from .clock import ClockSync, now_us
 from .protocol import (
     AUDIO_PORT,
+    CLIPBOARD_PORT,
     CODE_TO_SIDE,
     CONTROL_PORT,
     DISCOVERY_PORT,
@@ -375,6 +376,105 @@ class AudioReceiver(_BoundThread):
             except OSError:
                 pass
             self._sock = None
+
+
+# ---------------------------------------------------------------- 剪贴板 UDP
+
+class ClipboardSender:
+    """把剪贴板内容按 MTU 分块发到对端的 CLIPBOARD_PORT(参考 Deskflow)。
+
+    ★ 为什么要自己分块(而不是发一个大包):
+      Deskflow 用 ClipboardChunk 做 start/data/end 分块传输。我们必须
+      照做, 因为 UDP 包一旦超过 MTU(1500)就会被 IP 分片, 而 **任一分片
+      丢失整个数据报就作废** —— 这在音频上已经吃过一次亏(见 agent 的
+      SEND_FRAMES=120)。剪贴板图片动辄几 MB, 不分块必然丢。
+    """
+
+    def __init__(self, host: str, port: int = CLIPBOARD_PORT):
+        self.addr = (host, port)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # 剪贴板是"尽力而为": 丢一块就整份放弃(接收端会拒绝半份内容),
+        # 不重传 —— 重传会让"复制"操作卡住, 而且用户再复制一次即可。
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF,
+                                  1 << 20)
+        except OSError:
+            pass
+        self.sent_chunks = 0
+        self.failed = 0
+
+    def send_blob(self, blob: bytes, seq: int) -> bool:
+        """把整份内容切块发出。返回是否所有块都 sendto 成功。"""
+        from .clipboard_sync import split_payload, unpack_chunk
+        ok = True
+        for chunk in split_payload(seq, blob):
+            try:
+                self._sock.sendto(chunk, self.addr)
+                self.sent_chunks += 1
+            except OSError:
+                self.failed += 1
+                ok = False
+        return ok
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+class ClipboardReceiver(_BoundThread):
+    """收对端的剪贴板分块, 拼好后回调 (payload: dict[fmt, bytes])。
+
+    ★ 拼装器必须能处理**乱序**(UDP 常态)。见 _Assembler 的说明。
+    """
+
+    def __init__(self, port: int = CLIPBOARD_PORT, on_payload=None):
+        super().__init__("ClipboardReceiver", port, socket.SOCK_DGRAM)
+        from .clipboard_sync import _Assembler
+        self._asm = _Assembler()
+        self._on_payload = on_payload
+        self.received = 0
+        self.assembled = 0
+        self.bad = 0
+
+    def set_handler(self, fn) -> None:
+        self._on_payload = fn
+
+    def run(self) -> None:
+        from .clipboard_sync import decode, unpack_chunk
+        s = self._sock
+        if s is None:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            _bind_exclusive(s, self.port)
+            self._sock = s
+        s.settimeout(0.5)
+        while not self._stop.is_set():
+            try:
+                data, _addr = s.recvfrom(65535)
+            except (socket.timeout, TimeoutError):
+                continue
+            except OSError:
+                break
+            info = unpack_chunk(data)
+            if info is None:
+                self.bad += 1
+                continue
+            self.received += 1
+            kind, seq, total, offset, _cseq, payload = info
+            blob = self._asm.feed(kind, seq, total, offset, payload)
+            if blob is None:
+                continue
+            self.assembled += 1
+            items = decode(blob)
+            if not items:
+                self.bad += 1
+                continue
+            if self._on_payload is not None:
+                try:
+                    self._on_payload(items)
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 # ---------------------------------------------------------------- 输入 UDP
