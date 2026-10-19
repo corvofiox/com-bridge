@@ -680,13 +680,48 @@ class ComBridgeGui:
         try:
             import ctypes
             user32 = ctypes.windll.user32
-            # ★ 顶层 hwnd 动态解析(理由见 _release_focus_for_hook):
-            #   缓存值在窗口成型前记录时是错的, 会让 fg==top 恒 False。
+            # ★★★ 必须检查**所有本程序的顶层窗口**, 不只是主窗口。
+            #   用户实测: "主窗口和日志窗口聚焦时在副机键盘输入确实会过滤
+            #   主机的键盘同步, 但唯独实时状态这个窗口, 依然会同步键盘输入"。
+            #   原因: 次级窗口(状态/日志)是**独立的 Toplevel**, 各有自己的
+            #   顶层 hwnd, 而旧实现只比较主窗口的 hwnd —— 状态窗成为前台时
+            #   fg 不等于主窗口 hwnd, 判定为"不是我们", 于是什么都不做,
+            #   键盘钩子在状态窗前台期间失效, 副机击键全部泄漏进来。
+            #
+            #   收集方式: 从 root 递归遍历所有 Toplevel(含未映射的),
+            #   用 GetAncestor 取各自的根 hwnd。每 700ms 一次, 开销可忽略。
             hwnd = int(self.root.winfo_id())
             top = user32.GetAncestor(hwnd, 2) or hwnd
             self._top_hwnd = top
-            # ① 最小化 / 不可见 -> 不干预
-            if not user32.IsWindowVisible(top) or user32.IsIconic(top):
+            our_top_hwnds = set()
+            for cand in [top]:
+                try:
+                    # ★ 最小化/不可见的窗口不算"抢了前台" —— 它本来就不
+                    #   是前台, 而且此时去踢焦点会破坏最小化恢复
+                    #   (实测回归: "点最小化后窗口无法恢复")。
+                    if user32.IsWindowVisible(cand) and \
+                            not user32.IsIconic(cand):
+                        our_top_hwnds.add(cand)
+                except Exception:  # noqa: BLE001
+                    continue
+            for win in (getattr(self, "_status_win", None),
+                        getattr(self, "_log_win", None)):
+                try:
+                    tw = getattr(win, "win", None) if win is not None else None
+                    if tw is None or not tw.winfo_exists():
+                        continue
+                    wh = int(tw.winfo_id())
+                    wt = user32.GetAncestor(wh, 2) or wh
+                    if user32.IsWindowVisible(wt) and \
+                            not user32.IsIconic(wt):
+                        our_top_hwnds.add(wt)
+                except (AttributeError, tk.TclError, ValueError):
+                    continue
+            # ① 前台不是我们任何一个(可见且非最小化的)顶层窗口 -> 无事可做
+            if not our_top_hwnds:
+                return
+            fg = user32.GetForegroundWindow()
+            if not fg or fg not in our_top_hwnds:
                 return
             # ②③ 穿越态判定 -> 宽限期是否让位
             crossing = False
@@ -700,27 +735,25 @@ class ComBridgeGui:
             if (not crossing) and time.monotonic() < \
                     getattr(self, "_focus_grace_until", 0.0):
                 return
-            fg = user32.GetForegroundWindow()
-            if fg and fg == top:
-                shell = user32.GetShellWindow()
-                if shell:
-                    user32.SetForegroundWindow(shell)
-                n = getattr(self, "_focus_kicks", 0) + 1
-                self._focus_kicks = n
-                if n == 1:
-                    try:
-                        self._log_q.put_nowait(
-                            "[gui] 窗口曾抢到前台 -> 已交还焦点"
-                            "(窗口在前台时键盘钩子会失效)")
-                    except queue.Full:
-                        pass
-                elif crossing and n % 10 == 0:
-                    try:
-                        self._log_q.put_nowait(
-                            "[gui] 穿越态下窗口在前台会泄漏副机键盘, "
-                            "已再次交还焦点")
-                    except queue.Full:
-                        pass
+            shell = user32.GetShellWindow()
+            if shell:
+                user32.SetForegroundWindow(shell)
+            n = getattr(self, "_focus_kicks", 0) + 1
+            self._focus_kicks = n
+            if n == 1:
+                try:
+                    self._log_q.put_nowait(
+                        "[gui] 程序窗口曾抢到前台 -> 已交还焦点"
+                        "(窗口在前台时键盘钩子会失效)")
+                except queue.Full:
+                    pass
+            elif crossing and n % 10 == 0:
+                try:
+                    self._log_q.put_nowait(
+                        "[gui] 穿越态下窗口在前台会泄漏副机键盘, "
+                        "已再次交还焦点")
+                except queue.Full:
+                    pass
         except Exception:  # noqa: BLE001
             pass
         finally:

@@ -483,7 +483,12 @@ class Agent:
                   flush=True)
             if self._stop.wait(backoff):
                 break
-            backoff = min(backoff * 2, 30.0)   # 指数退避, 上限 30s
+            # ★ 指数退避, 上限 **5s**(用户要求: "副机在重连主机连接时的
+            #   请求间隔要压在5秒之内, 30秒太长了")。
+            #   上限 30s 时, 主机短暂重启/网络抖动后要等半分钟才能恢复,
+            #   用户会觉得"程序卡死了"。5s 足够避免对端被压垮, 又能让
+            #   恢复几乎无感。2 -> 4 -> 5 -> 5 ...
+            backoff = min(backoff * 2, 5.0)
             if self._stop.is_set():
                 break
             try:
