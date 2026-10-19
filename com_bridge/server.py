@@ -933,6 +933,31 @@ class Server:
                         + int(self._ren.rate * min(over_ms, 95.0) / 1000.0)))
                 else:
                     budget = max(0, min(avail, render_target - padding))
+
+                # ★★★ 送进 Resampler 的 max_out 必须 >= 本轮**可产出量**,
+                #   不能直接用 budget(它受 WASAPI 剩余空间限制)。
+                #
+                #   实测根因(diag_sinc_threshold.py + diag_audio_80ms.py):
+                #   水位高时队列里积压了大量待播数据, 但 WASAPI 渲染缓冲
+                #   已接近满(render_target - padding ≈ 0), 于是 budget 很小。
+                #   `Resampler.process(max_out=小)` 就把 out_n 卡住 ->
+                #   每轮消费的输入帧远少于队列里的量 -> `_pos` 推进极慢 ->
+                #   **抽头窗口始终贴着缓冲末端** -> 越来越多抽头被零填充 ->
+                #   波形被截断成宽带噪声(听感: 微小沙沙声)。
+                #   这**正好**解释用户观察到的 "水位超过 ~80ms 就出现杂音":
+                #   水位越高, 积压越多, 末端截断比例越大。
+                #
+                #   修法: 让 Resampler 按"队列里有多少可产"来产出(推进
+                #   相位、保持波形完整), 产出的 PCM 再按 WASAPI 的剩余
+                #   空间写入; 写不完的部分**丢弃**(音频直播里旧数据无价值,
+                #   且丢弃发生在完整波形之后, 不会切断插值窗口)。
+                #   这样 `_pos` 始终跟得上队列, 抽头窗口永远有完整样本。
+                pop_budget = max(budget, 0)
+                if peer_buf is not None and over_ms > 0 and avail > 0:
+                    # 超调时按队列实际可产出来取, 上限一帧 render_target
+                    want_frames = int(self._ren.rate
+                                      * min(level_ms, 95.0) / 1000.0)
+                    pop_budget = max(budget, min(want_frames, avail))
                 if peer_buf is not None and level_ms > self.max_level_ms():
                     dropped_frames = peer_buf.trim_to(target_ms=self.jitter_ms) \
                         if hasattr(peer_buf, "trim_to") else 0
@@ -955,17 +980,27 @@ class Server:
                 #   这里保持原逻辑, 不引入不必要的风险。
 
                 peer = None
-                if peer_buf is not None and budget > 0:
-                    peer = peer_buf.pop_aligned(now_us(), budget,
+                if peer_buf is not None and pop_budget > 0:
+                    peer = peer_buf.pop_aligned(now_us(), pop_budget,
                                                 lookahead_us,
                                                 ratio_override=ratio)
                     if peer is None:
                         lag = peer_buf.head_lag_ms(now_us())
                         if lag is not None and lag > self.jitter_ms * 3.0:
-                            peer = peer_buf.pop_any(budget)
+                            peer = peer_buf.pop_any(pop_budget)
                             self.stats["resync_popped"] = \
                                 self.stats.get("resync_popped", 0) + 1
                     peer_buf.drain_level_ms = level_ms
+                    # ★ 产出的 PCM 可能多于 WASAPI 剩余空间(因为
+                    #   pop_budget 是按队列可产出量算的, 不是按 avail)。
+                    #   超出部分截掉 —— 见上方 ★★★ 的说明: 丢弃发生在
+                    #   **完整波形之后**, 不会切断插值抽头窗口。
+                    if peer is not None:
+                        max_bytes = max(0, avail) * block
+                        if len(peer) > max_bytes:
+                            peer = peer[:max_bytes]
+                        if not peer:
+                            peer = None
 
             if peer is None:
                 # 队列暂无数据(包在路上): 先什么都不写, 让 WASAPI 把缓冲里

@@ -168,6 +168,11 @@ class CursorHider:
         # 这一隐藏前提, 光标现形(用户实测: 出点在滚动条/按钮等可交互
         # 元素上时主机指针不消失)。
         self._capture_changed = 0
+        # ★ 诊断: hider 是否真的抢到了前台 —— 这是 SetCapture 生效的
+        #   **前提**(MSDN: 只有前台窗口才能捕获鼠标)。
+        self._is_foreground = False
+        # 前台被抢走的次数(保活定时器重夺计数)。>0 说明有程序在抢焦点。
+        self._fg_regrabs = 0
         self._class_name = f"ComBridgeHider_{id(self):x}"   # 每实例唯一
 
     # -- 生命周期 ------------------------------------------------------
@@ -268,18 +273,63 @@ class CursorHider:
             self._do_show()
             return 0
         if msg == WM_TIMER and wparam == KEEPALIVE_TIMER_ID and self._shown:
-            # ★ 保活: 捕获被可交互窗口(滚动条/悬停跟踪)持续争抢时,
-            #   WM_CAPTURECHANGED 只提醒一次, 之后对方仍持有捕获。
-            #   每 100ms 主动查一次: 不是自己就立刻重夺 + 补抖动提交。
+            # ★★★ 保活: **前台 + 捕获**都必须在手上, 缺一光标就现形。
+            #   前台可能被用户点别的窗口抢走; 捕获可能被可交互控件
+            #   (滚动条/悬停跟踪)抢走。两者都每 100ms 重验一次。
+            #
+            #   为什么前台是必需的: MSDN 规定 SetCapture 只在"按钮按下
+            #   或窗口是前台"时生效。丢了前台, 捕获随时会失效, 光标就
+            #   重新出现 —— 这正是用户反复报的"光标没消失"。
+            need_recover = False
+            if user32.GetForegroundWindow() != hwnd:
+                fg = user32.GetForegroundWindow()
+                fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+                my_tid = kernel32.GetCurrentThreadId()
+                attached = False
+                if fg_tid and fg_tid != my_tid:
+                    try:
+                        attached = bool(
+                            user32.AttachThreadInput(fg_tid, my_tid, TRUE))
+                    except Exception:  # noqa: BLE001
+                        attached = False
+                try:
+                    user32.BringWindowToTop(hwnd)
+                    user32.SetForegroundWindow(hwnd)
+                finally:
+                    if attached:
+                        try:
+                            user32.AttachThreadInput(fg_tid, my_tid, FALSE)
+                        except Exception:  # noqa: BLE001
+                            pass
+                self._is_foreground = (user32.GetForegroundWindow() == hwnd)
+                need_recover = True
+                self._fg_regrabs = getattr(self, "_fg_regrabs", 0) + 1
             if user32.GetCapture() != hwnd:
                 self._capture_changed += 1
                 user32.SetCapture(hwnd)
                 self._captured = (user32.GetCapture() == hwnd)
-                if self._captured:
-                    from .input import InputInjector
-                    InputInjector.move_relative(1, 0)
-                    InputInjector.move_relative(-1, 0)
+                need_recover = True
+            if need_recover:
+                # 重新提交光标可见性(前台/捕获变化会让系统重新评估光标)
+                _set_cursor_visibility(False)
+                if self._hide_mono:
                     self._hide_mono = time.monotonic()
+            else:
+                # ★★★ 光标可见性守卫(用户实测: 光标在**空桌面**时隐藏会
+                #   在 1.2s 后失效, 而记事本/其它程序位置却稳)。
+                #   诊断发现: Z 序最顶是 **Quicker 的悬浮面板窗口**
+                #   (HwndWrapper[Quicker.exe...]) —— 这类第三方工具在
+                #   自己显示/隐藏悬浮层时会调用 ShowCursor(TRUE), 把
+                #   我们的隐藏状态**从外部重置**。
+                #   我们的前台与捕获都还在(regrabs=0/capchg=0), 但系统
+                #   的光标可见性计数器被别人加回去了 -> 光标现形。
+                #   守卫: 每 100ms 主动查一次 GetCursorInfo, 若光标又
+                #   可见了就重新压一次计数器。这才是"任何位置都稳定"
+                #   的关键 —— 不能假设只有我们能改可见性。
+                if self._cursor_guard_visible():
+                    self._guard_represses = \
+                        getattr(self, "_guard_represses", 0) + 1
+                    _set_cursor_visibility(False)
             return 0
         if msg == WM_CAPTURECHANGED and self._shown:
             # 捕获被抢走(用户点击拖拽了别的应用): 不重新捕获的话,
@@ -373,6 +423,35 @@ class CursorHider:
             self._injected_seen += 1
         return injected
 
+    def _cursor_guard_visible(self) -> bool:
+        """光标当前是否**又变回可见**了(被外部软件重置)。
+
+        ★ 为什么要这个守卫(实测): 光标停在空桌面时隐藏会在 1.2s 后失效,
+          而记事本位置却稳定。诊断发现 Z 序最顶是 **Quicker 的悬浮面板**
+          (HwndWrapper[Quicker.exe...]) —— 这类第三方工具显示/隐藏悬浮
+          层时会调 ShowCursor(TRUE), 把系统的可见性计数器加回去。
+          我们无法阻止别人调 ShowCursor, 只能**周期性检查并重新压下去**。
+
+        用 GetCursorInfo 的 CURSOR_SHOWING 标志判定(真实屏幕状态),
+        而不是 ShowCursor 的返回值(那只是本线程计数器的快照)。
+        """
+        try:
+            class CURSORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD),
+                            ("flags", wintypes.DWORD),
+                            ("hCursor", wintypes.HANDLE),
+                            ("ptScreenPos", wintypes.POINT)]
+            ci = CURSORINFO()
+            ci.cbSize = ctypes.sizeof(CURSORINFO)
+            user32.GetCursorInfo.argtypes = [ctypes.c_void_p]
+            user32.GetCursorInfo.restype = wintypes.BOOL
+            if not user32.GetCursorInfo(ctypes.byref(ci)):
+                return False
+            CURSOR_SHOWING = 0x00000001
+            return bool(ci.flags & CURSOR_SHOWING)
+        except Exception:  # noqa: BLE001
+            return False
+
     def _do_hide(self) -> None:
         from .input import get_cursor_pos
         # ★★★ 生产组合(低级钩子吞掉物理输入)下的关键差异:
@@ -413,45 +492,70 @@ class CursorHider:
                             d.width, d.height,
                             SWP_NOACTIVATE | SWP_SHOWWINDOW)
 
-        # --- 激活: 只 SetActiveWindow, **绝不 SetForegroundWindow** ---
+        # --- 激活 + 抢前台(这是光标隐藏能生效的**必要条件**) ---
         #
-        # ★★★★ 绝不能再抢前台! 实测归因(tools/exp_hide_step_attribution.py):
-        #   逐步施加 hide() 的每一步, 每步后测 kbd_calls:
-        #     基线                   kbd_calls+4  ✅
-        #     + 全屏窗显示           kbd_calls+4  ✅
-        #     + SetActiveWindow      kbd_calls+4  ✅   (fg 变了但钩子活着)
-        #     + SetForegroundWindow  kbd_calls+0  ❌ **钩子当场死亡**
-        #     + SetCapture           kbd_calls+4  ✅
-        #     + ShowCursor(FALSE)    kbd_calls+4  ✅
-        #   即: **只有抢前台会杀死键盘钩子**。机制是 Windows 对前台窗口
-        #   所属进程有特殊输入路由 —— 全屏 hider 成为前台后, 键盘输入
-        #   不再经过本进程的低级钩子链, 于是:
-        #       kbd_calls 恒 0(回调没人调)
-        #       + 键照常流入系统(RawInput 看到泄漏, 自愈循环被触发)
-        #       + 重装也无效(钩子没坏, 是路由变了)
-        #   这正是用户报的 "鼠标进副机后, 在副机打字主机也同步输入"
-        #   —— 主机钩子没吞键, 键落到了主机焦点窗口。
+        # ★★★ 2026-10-19 第二次纠正(用户: "光标没消失...并非一定在这个
+        #   条件下才会触发, 你需要全面审查整个跨屏幕光标隐藏功能"):
         #
-        #   而 Deskflow 的 primary 分支(MSWindowsDesks.cpp deskLeave)恰恰
-        #   只用 EnableWindow + SetActiveWindow, secondary 用 SetCapture,
-        #   两边都**不抢前台**(本文件头第 15 行早就写着这条, 代码却违背了它)。
+        #   **旧实现刻意不抢前台, 那是错的。**
+        #   MSDN 对 SetCapture 的明确限制:
+        #     "This function only captures the mouse when the mouse button
+        #      is down or the window is in the foreground."
+        #     "Only the foreground window can capture the mouse."
+        #   旧代码只做 SetActiveWindow 而不抢前台 -> SetCapture 在
+        #   "鼠标按钮未按下 + 非前台"时**根本不生效** -> 本线程收不到
+        #   鼠标消息 -> ShowCursor 的按线程计数器不提交 ->
+        #   **光标一直可见**。这与用户观察完全吻合: 光标停在别的程序
+        #   窗口上层时最容易察觉, 但其实是**任何位置都可能失败**
+        #   (取决于当时是否有按钮按下/窗口是否恰好是前台)。
         #
-        #   光标隐藏是否还成立? 成立 —— SetCapture 让本线程接管鼠标输入,
-        #   ShowCursor 的按线程计数器随后由 _do_hide 末尾的抖动注入提交
-        #   (实测 SetCapture + 抖动注入在 SetActiveWindow 之下即可生效)。
+        #   ★ 为什么以前会得出"抢前台会杀死键盘钩子"的结论?
+        #     那次实验用的是 **tkinter 主窗口**(普通 GUI 窗口), 实测
+        #     kbd_calls 8->0。但 hider 是完全不同的窗口类型:
+        #       WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | 全屏 | 类光标全透明
+        #     重新实测(tools/exp_hider_foreground_hook.py):
+        #       A. 基线(焦点在资源管理器)         kbd_calls +2
+        #       B. **hider 抢前台后**              kbd_calls +2  同样可达!
+        #       C. 抢前台 + 同一线程 SetCapture   光标 vis=False ✅
+        #     即: hider 抢前台**不会**破坏键盘钩子。过去那条结论
+        #     被错误地从"tkinter 主窗口"外推到了"所有窗口"。
+        #
+        #   ★ 还必须注意 SetCapture 是**按线程**的: 必须在 hider 自己的
+        #     线程里调用(本函数正是运行在 hider 线程的消息循环里)。
+        #     从别的线程调 SetCapture(hider) 实测 GetCapture() 返回 None。
+        #
+        #   这样也不用再依赖"抖动注入来提交计数器"那条脆弱链路 ——
+        #   前台窗口的光标状态会被内核直接提交。
         self._stolen_foreground = user32.GetForegroundWindow()
         user32.EnableWindow(self._hwnd, TRUE)
         user32.SetActiveWindow(self._hwnd)
-        # 诊断: 记录"活动窗口是否是我们"(不是前台! 前台永远不抢)
+        # 用 AttachThreadInput 强制抢前台(照搬 MSWindowsDesks.cpp :617-622)
+        fg = user32.GetForegroundWindow()
+        if fg and fg != self._hwnd:
+            fg_tid = user32.GetWindowThreadProcessId(fg, None)
+            my_tid = kernel32.GetCurrentThreadId()
+            attached = False
+            if fg_tid and fg_tid != my_tid:
+                attached = bool(user32.AttachThreadInput(fg_tid, my_tid, TRUE))
+            try:
+                user32.BringWindowToTop(self._hwnd)
+                user32.SetForegroundWindow(self._hwnd)
+            finally:
+                if attached:
+                    user32.AttachThreadInput(fg_tid, my_tid, FALSE)
+        # 诊断: 前台是否真的抢到了(这是光标能隐藏的前提)
+        self._is_foreground = (user32.GetForegroundWindow() == self._hwnd)
         self._activated = (user32.GetActiveWindow() == self._hwnd)
 
         # --- 捕获 + 计数器(照搬 :633 + setCursorVisibility) ---
+        # 现在已是前台, SetCapture 才会真正生效。
         user32.SetCapture(self._hwnd)
         self._captured = (user32.GetCapture() == self._hwnd)
         self._counter_after_hide = _set_cursor_visibility(False)
 
-        # ★ 启动保活定时器: 周期重验捕获(见 WM_TIMER 分支)。
-        #   对抗"出点在滚动条/悬停跟踪元素上"时对方的持续重抢。
+        # ★ 启动保活定时器: 周期重验"前台 + 捕获"(见 WM_TIMER 分支)。
+        #   前台可能被别的程序抢走(用户点了别的窗口), 捕获也可能被
+        #   可交互控件抢走 —— 两者任一丢失, 光标就会现形。
         user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t,
                                     wintypes.UINT, ctypes.c_void_p]
         user32.SetTimer.restype = ctypes.c_size_t
@@ -460,10 +564,9 @@ class CursorHider:
         # --- 强制提交(照搬 :644-645) ---
         # "windows can take a while to hide the cursor, so wait a few
         #  milliseconds to ensure the cursor is hidden before centering"
+        # 前台已能提交光标状态, 这里保留抖动作为**双保险**
+        # (生产中物理事件被钩子吞掉, 只能靠注入产生一次消息)。
         time.sleep(0.03)
-        # 注入一次 1px 抖动(带 TAG): 若本线程在捕获/焦点状态, 这条消息
-        # 流经本线程 -> 提交计数器。注入(而非等物理)是因为生产中物理
-        # 事件全被钩子吞了, 永远等不到。
         from .input import InputInjector
         InputInjector.move_relative(1, 0)
         time.sleep(0.02)
@@ -491,8 +594,29 @@ class CursorHider:
                             | SWP_HIDEWINDOW)
         user32.EnableWindow(self._hwnd, FALSE)   # 照搬 deskEnter :558
         self._counter_after_show = _set_cursor_visibility(True)
-        # ★★ 不再"恢复被抢走的前台窗口": 我们从没抢过前台(见 _do_hide 的
-        #   ★★★★)。以前这里会把 _stolen_foreground 重新 SetForegroundWindow
-        #   —— 那等于在用户正打字的窗口上又抢一次焦点, 既多余又会短暂
-        #   中断用户的键盘输入。现在只清掉记录。
+        self._is_foreground = False
+        # ★★★ 必须把前台**还给用户原来的窗口**(2026-10-19 修正)。
+        #   _do_hide 现在会抢前台(这是 SetCapture 生效的前提), 所以在
+        #   退出穿越时必须恢复, 否则用户的键盘焦点会停在那个全屏透明
+        #   窗口上 —— 表现为"回到主机后打字没反应, 要点一下窗口才行"。
+        #   恢复方式同抢: AttachThreadInput + SetForegroundWindow。
+        prev = self._stolen_foreground
+        if prev:
+            try:
+                fg = user32.GetForegroundWindow()
+                if fg != prev:
+                    fg_tid = user32.GetWindowThreadProcessId(fg, None) \
+                        if fg else 0
+                    my_tid = kernel32.GetCurrentThreadId()
+                    attached = False
+                    if fg_tid and fg_tid != my_tid:
+                        attached = bool(
+                            user32.AttachThreadInput(fg_tid, my_tid, TRUE))
+                    try:
+                        user32.SetForegroundWindow(prev)
+                    finally:
+                        if attached:
+                            user32.AttachThreadInput(fg_tid, my_tid, FALSE)
+            except Exception:  # noqa: BLE001
+                pass
         self._stolen_foreground = None

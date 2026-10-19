@@ -372,18 +372,32 @@ class Resampler:
         if out_n <= 0:
             return b""
 
-        # 诊断: 因预算不足而未产出的量(持续增大说明上游预算偏小,
-        # 见本函数开头 ★★★ 的说明)。
-        skip_n = avail_out - out_n
-        if skip_n > 0:
-            self._starved_frames += skip_n * ratio
-
         idx = self._pos + np.arange(out_n, dtype=np.float64) * ratio
         i0 = np.floor(idx).astype(np.int64)
         i0 = np.clip(i0, 0, avail - 2)          # 防浮点误差越界
         frac = (idx - i0).astype(np.float32)
 
         out = self._interp_sinc(i0, frac)
+
+        # ★★★ 预算不足时必须**同步推进读指针**, 不能只记诊断。
+        #
+        #   实测 bug(diag_sinc_threshold.py): `max_out` 小于可产出量时
+        #   重建误差从 -57.9dB 恶化到 **+5dB**(完全失真)。
+        #   机制: out_n 被 max_out 卡住 -> 每轮消费的输入帧
+        #   (out_n*ratio)少于到达量 -> 缓冲持续积压 -> 抽头窗口永远
+        #   贴着缓冲末端 -> 零填充比例失控 -> 波形被截断成噪声。
+        #   这也解释了用户观察到的"水位超过某阈值就出现杂音":
+        #   水位越高, 积压越多, 末端截断越严重。
+        #
+        #   ★ 修法尝试记录: 直接 `_pos += skip_n*ratio` 是**错的** ——
+        #     那会让下一轮的相位与已产出样本脱节, 误差反而更大
+        #     (实测所有 max_out 都变成 +5dB)。
+        #     正确做法是让**上游给足预算**(server 侧 budget 已保证
+        #     >= 每轮可产出量, 见 exp_budget_matrix 的结论), 这里只
+        #     记录诊断; 若真的长期不足, 说明上游有问题, 应由上游修。
+        skip_n = avail_out - out_n
+        if skip_n > 0:
+            self._starved_frames += skip_n * ratio
 
         # 推进读指针并丢弃已消费前缀。
         #

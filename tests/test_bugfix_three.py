@@ -179,46 +179,32 @@ class TestBug1CallbackStaysCheap:
         assert h._key_queue, "必须入队"
         assert h._key_wake.is_set(), "必须唤醒转发线程"
 
-    def test_hider_never_steals_foreground(self):
-        """★★★ 抢前台会**杀死键盘钩子** —— 这是 BUG1 的最终根因。
+    def test_hider_must_steal_foreground(self):
+        """★★★ hider **必须**抢前台(2026-10-19 结论反转)。
 
-        (本测试替换了旧的两条 test_force_foreground_*, 那两条锁定的是
-         "抢前台"的设计 —— 而实测证明那个设计本身就会杀死钩子。)
-
-        实测归因(tools/exp_hide_step_attribution.py):
-            基线                   kbd_calls+4  ✅
-            + 全屏窗显示           kbd_calls+4  ✅
-            + SetActiveWindow      kbd_calls+4  ✅
-            + SetForegroundWindow  kbd_calls+0  ❌ 钩子当场死亡
-            + SetCapture           kbd_calls+4  ✅
-            + ShowCursor(FALSE)    kbd_calls+4  ✅
-
-        因果链: 鼠标进副机 -> _acquire_control -> hider.hide() 抢前台
-        -> Windows 改变本进程的输入路由, 键盘不再经过 LL 钩子
-        -> kbd_calls 恒 0, 键流入主机焦点应用
-        -> 用户报的"在副机打字, 主机也同步输入"; 且重装无效(钩子没坏)。
-
-        Deskflow 的 primary 只用 EnableWindow + SetActiveWindow,
-        secondary 用 SetCapture, 两边都不抢前台。
+        旧测试断言"抢前台杀死钩子", 依据是 tkinter 主窗口的实测。
+        重新实测 hider 窗口(WS_EX_TRANSPARENT|TOOLWINDOW):
+            基线 kbd_calls +2 / hider 抢前台后 kbd_calls +2 —— 钩子照样可达。
+        而 MSDN 规定 SetCapture 只在"按钮按下或窗口在前台"时生效,
+        所以不抢前台 -> 捕获无效 -> 光标不消失(用户报的核心问题)。
+        详见 tools/exp_hider_foreground_hook.py 与 cursor.py 的注释。
         """
-        assert not hasattr(cursor_mod.CursorHider, "_force_foreground"), \
-            "抢前台的方法必须删除"
-        hide_src = _strip_comments(
-            inspect.getsource(cursor_mod.CursorHider._do_hide))
-        # 去掉注释后仍不得出现这些 API
-        assert "SetForegroundWindow" not in hide_src, \
-            "★ hide() 抢前台会杀死键盘钩子(实测 kbd_calls 4->0)"
-        assert "AttachThreadInput" not in hide_src, \
-            "AttachThreadInput 是抢前台辅助, 同样不该出现"
-        # 但激活与捕获必须保留(它们不杀钩子, 且是隐藏光标的必要条件)
-        assert "SetActiveWindow" in hide_src
-        assert "SetCapture" in hide_src
+        import inspect as _insp
+        from com_bridge import cursor as _cur
+        hide_src = _insp.getsource(_cur.CursorHider._do_hide)
+        assert "SetForegroundWindow" in hide_src, \
+            "must steal foreground for SetCapture to work"
+        show_src = _insp.getsource(_cur.CursorHider._do_show)
+        assert "SetForegroundWindow" in show_src, \
+            "must restore foreground on release"
 
-    def test_show_does_not_steal_foreground_back(self):
-        """show() 不该把前台抢回去 —— 我们从没抢过, 抢回去会打断用户打字。"""
+    def test_show_restores_foreground(self):
+        """show() 必须还原前台(因为 hide 抢过)。"""
         show_src = _strip_comments(
             inspect.getsource(cursor_mod.CursorHider._do_show))
-        assert "SetForegroundWindow" not in show_src
+        assert "SetForegroundWindow" in show_src
+        assert "_stolen_foreground" in show_src
+        assert "__never_used__" not in show_src
 
     def test_no_chain_head_reclaim_machinery(self):
         """★★ **不得存在**"链首抢占"机制 —— 那是被推翻的错误推论。

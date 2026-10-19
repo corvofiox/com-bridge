@@ -60,13 +60,30 @@ def test_hider_starts_and_stops_timer():
     assert "KillTimer" in show_src, "show 必须停止保活"
 
 
-def test_hider_reacquire_injects_jitter():
-    """重夺捕获后必须补抖动注入(否则计数器不提交, 光标仍可见)。"""
+def test_hider_reacquire_represses_cursor():
+    """保活重夺后必须**重新压光标可见性**。
+
+    ★ 实现演进(2026-10-19 第二版): 早期用"补一次抖动注入"来提交计数器,
+      但实测发现更可靠的是直接 `_set_cursor_visibility(False)` ——
+      因为外部软件(如 Quicker 悬浮面板)会调 ShowCursor(TRUE) 把
+      计数器加回去, 光靠提交旧计数器压不住。
+    """
     proc = inspect.getsource(cursor_mod.CursorHider._proc)
-    # WM_TIMER 分支里重夺后应有注入
     i_timer = proc.index("WM_TIMER")
-    seg = proc[i_timer:i_timer + 900]
-    assert "move_relative" in seg, "重夺后必须注入抖动提交计数器"
+    seg = proc[i_timer:i_timer + 2200]
+    assert "_set_cursor_visibility" in seg, \
+        "重夺后必须重新压光标可见性"
+    assert "_cursor_guard_visible" in proc, \
+        "必须有周期性光标可见性守卫(对抗外部软件 ShowCursor)"
+
+
+def test_hider_rechecks_foreground_in_keepalive():
+    """★ 保活必须同时重验前台 —— 前台是 SetCapture 生效的前提。"""
+    proc = inspect.getsource(cursor_mod.CursorHider._proc)
+    i_timer = proc.index("WM_TIMER")
+    seg = proc[i_timer:i_timer + 2200]
+    assert "GetForegroundWindow" in seg, "必须检查前台是否还在手上"
+    assert "SetForegroundWindow" in seg, "前台丢了要重夺"
 
 
 def test_hider_counts_capture_changes():

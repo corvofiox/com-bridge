@@ -67,17 +67,43 @@ def test_force_foreground_is_gone():
         "抢前台的方法必须删除 —— 它会让键盘钩子死亡(实测)"
 
 
-def test_do_hide_never_sets_foreground():
-    """_do_hide 的可执行代码里绝不能出现 SetForegroundWindow。"""
+def test_do_hide_must_set_foreground():
+    """★★★ _do_hide **必须**抢前台 —— 这是光标能隐藏的必要条件。
+
+    ★ 2026-10-19 结论反转(第二版):
+      旧测试断言"抢前台会杀死键盘钩子", 依据是 kbd_calls 4->0。
+      但那次归因用的是 **tkinter 主窗口**, 而 hider 是完全不同的窗口类型
+      (WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | 全屏 | 类光标全透明)。
+      重新实测(tools/exp_hider_foreground_hook.py):
+          A. 基线                kbd_calls +2
+          B. **hider 抢前台后**   kbd_calls +2  <- 钩子照样可达!
+          C. 抢前台 + SetCapture  光标 vis=False ✅
+      旧结论被错误地从"tkinter 主窗口"外推到了"所有窗口"。
+
+    ★ 为什么必须抢前台: MSDN 对 SetCapture 的明确限制 ——
+      "only captures the mouse when the mouse button is down or the
+       window is in the foreground"。
+      旧代码只 SetActiveWindow 不抢前台 -> 非前台时 SetCapture 无效
+      -> 本线程收不到鼠标消息 -> ShowCursor 计数不提交 -> **光标可见**。
+      这是用户反复报的"光标不消失"的真正根因(任何位置都可能发生)。
+    """
     src = inspect.getsource(cursor_mod.CursorHider._do_hide)
     calls = _code_only(src)
-    assert "SetForegroundWindow" not in calls, \
-        "★ hide() 里抢前台会杀死键盘钩子(实测 kbd_calls 4->0)"
-    assert "AttachThreadInput" not in calls, \
-        "AttachThreadInput 是抢前台的辅助手段, 同样不该在 hide() 里"
-    # 但必须仍然激活(SetActiveWindow 是安全的, 实测钩子存活)
-    assert "SetActiveWindow" in calls, \
-        "必须保留 SetActiveWindow(它不杀钩子, 且让光标隐藏生效)"
+    assert "SetForegroundWindow" in calls, \
+        "★ 必须抢前台, 否则 SetCapture 不生效 -> 光标不消失"
+    assert "AttachThreadInput" in calls, \
+        "抢前台必须用 AttachThreadInput 强制(裸调会被系统拒绝)"
+    assert "SetCapture" in calls, "必须捕获鼠标"
+    assert "SetActiveWindow" in calls, "保留激活(抢前台的补充)"
+
+
+def test_do_hide_records_foreground_success():
+    """★ 必须记录"前台是否真抢到了", 供现场诊断。"""
+    src = inspect.getsource(cursor_mod.CursorHider._do_hide)
+    assert "_is_foreground" in src, \
+        "必须记录前台是否抢到(否则无法诊断'光标没消失')"
+    init_src = inspect.getsource(cursor_mod.CursorHider.__init__)
+    assert "_is_foreground" in init_src
 
 
 def test_do_hide_still_captures_and_hides_cursor():
@@ -89,9 +115,15 @@ def test_do_hide_still_captures_and_hides_cursor():
     assert "move_relative" in calls, "抖动注入必须保留(提交计数器)"
 
 
-def test_do_show_does_not_steal_foreground_back():
-    """show() 不该再把前台抢回去(我们从没抢过, 抢回去反而打断用户)。"""
+def test_do_show_restores_previous_foreground():
+    """★ show() **必须**把前台还给用户原来的窗口。
+
+    ★ 2026-10-19 结论反转: 因为 _do_hide 现在会抢前台(SetCapture 的
+      前提), 所以退出穿越时必须恢复, 否则键盘焦点会停在那个全屏透明
+      窗口上 —— 表现为"回到主机后打字没反应, 要点一下窗口才行"。
+    """
     src = inspect.getsource(cursor_mod.CursorHider._do_show)
     calls = _code_only(src)
-    assert "SetForegroundWindow" not in calls, \
-        "show() 里抢前台会中断用户正在打字的窗口"
+    assert "SetForegroundWindow" in calls, \
+        "★ 必须还原前台(否则用户键盘焦点停在全屏透明窗口上)"
+    assert "_stolen_foreground" in calls, "应还原到被抢走的那个窗口"
