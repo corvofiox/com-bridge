@@ -470,12 +470,33 @@ class Resampler:
         # 那会让内部缓冲缓慢增长, 应在 server._render_loop 的 budget
         # 计算里修正(见 process() 里 ★★★ 的说明)。
         self._starved_frames = 0.0
+        # 诊断: 内部积压峰值 / 应急排空次数 / 硬回退次数
+        #   backlog_max    : 内部缓冲历史最大帧数(正常应只有 ~100 帧)
+        #   backlog_drains : 触发"应急排空"(忽略预算先泄压)的次数
+        #   backlog_resets : 触发"硬回退"(丢最旧前缀)的次数 —— 应为 0
+        self._backlog_max = 0
+        self._backlog_drains = 0
+        self._backlog_resets = 0
         try:
             import numpy as np
 
             self._np = np
         except ImportError:
             self._np = None
+
+    @property
+    def backlog_frames(self) -> int:
+        """当前内部积压帧数(供水位/GUI 诊断)。"""
+        return len(self._buf) if self._buf is not None else 0
+
+    def diag(self) -> dict:
+        return {
+            "backlog": self.backlog_frames,
+            "backlog_max": self._backlog_max,
+            "drains": self._backlog_drains,
+            "resets": self._backlog_resets,
+            "pos": round(float(self._pos), 3),
+        }
 
     def _to_frames(self, pcm: bytes):
         if self._np is None:
@@ -530,22 +551,33 @@ class Resampler:
         else:
             self._buf = np.concatenate((self._buf, cur))
 
-        # ★★★ 积压极端保护(必须在计算索引**之前**做, 否则本轮算出的
-        #   i0 会指到裁剪后的缓冲之外 -> IndexError, 实测踩到)。
-        #   正常生产路径永不触发: 真实渲染器的 budget 足够大, 内部积压
-        #   实测只有 97 帧(tools/exp_budget_matrix.py)。只有上游异常
-        #   (渲染循环被长时间阻塞、预算持续偏小)才会积压到 500ms。
-        #   那时必须回退, 否则每轮 np.concatenate 越来越慢 ->
-        #   渲染超时 -> WASAPI 欠载 -> 成段杂音并持续恶化。
+        # ★★★ 积压保护(必须在计算索引**之前**做, 否则本轮算出的 i0 会
+        #   指到裁剪后的缓冲之外 -> IndexError, 实测踩到)。
         #
-        # ★ 回退时保留的帧数必须 >= sinc 抽头窗口, 否则回退那一轮会因
-        #   窗口缺样本产生一次爆音。32 抽头 + 余量 -> 96 帧足够。
+        #   2026-10-21 重做: 旧实现只有一个档位 —— 一旦超过 500ms 就
+        #   `_buf = _buf[-96:]; _pos = 0.0`, 也就是**丢掉 500ms 真实音频
+        #   并把读指针清零**(相位参照消失)。那是一次又长又响的断口。
+        #
+        #   新策略分两级:
+        #     ① 积压 > DRAIN_AT(300ms): **应急排空** —— 本轮忽略 max_out,
+        #        能产多少产多少, 让调用方(server)的 _render_carry 顺延
+        #        到后续轮次。这样积压会自己塌下去, **一个样本都不丢**。
+        #     ② 积压 > MAX_BACKLOG(500ms, 说明连排空都救不回来, 上游已
+        #        严重异常): 才做硬回退, 但**保留相位参照** —— 丢掉最旧的
+        #        前缀同时把 `_pos` 同步前移, 而不是清零; 这样读指针指向的
+        #        仍是同一段音频的延续, 只有内容跳过、没有相位突跳。
         BACKLOG_KEEP = 96
-        MAX_BACKLOG = 24000          # ≈500ms @48kHz
-        if len(self._buf) > MAX_BACKLOG:
+        DRAIN_AT = 14400             # ≈300ms @48kHz: 开始应急排空
+        MAX_BACKLOG = 24000          # ≈500ms @48kHz: 最后手段
+        n_buf = len(self._buf)
+        if n_buf > getattr(self, "_backlog_max", 0):
+            self._backlog_max = n_buf
+        if n_buf > MAX_BACKLOG:
             self._backlog_resets = getattr(self, "_backlog_resets", 0) + 1
-            self._buf = self._buf[-BACKLOG_KEEP:].copy()
-            self._pos = 0.0
+            drop = n_buf - BACKLOG_KEEP
+            self._buf = self._buf[drop:].copy()
+            # ★ 相位连续: 同步前移读指针(清零才会造成相位突跳)
+            self._pos = max(0.0, self._pos - drop)
             self._starved_frames = 0.0
 
         avail = len(self._buf)
@@ -557,8 +589,16 @@ class Resampler:
         avail_out = int((avail - KEEP_FRAMES - self._pos) / ratio)
         if avail_out <= 0:
             return b""
-        # 「按预算算」本轮允许产出多少(受调用方 max_out 决定)
-        out_n = avail_out if max_out is None else min(avail_out, max_out)
+        # 「按预算算」本轮允许产出多少(受调用方 max_out 决定)。
+        # ★ 积压达到应急阈值时**忽略预算**先排空 —— 宁可让调用方多拿一
+        #   批(它有 carry 逻辑), 也不要攒到 500ms 后一声不响丢掉半秒音频。
+        _draining = avail > DRAIN_AT
+        if max_out is None or _draining:
+            out_n = avail_out
+            if _draining:
+                self._backlog_drains = getattr(self, "_backlog_drains", 0) + 1
+        else:
+            out_n = min(avail_out, max_out)
         if out_n <= 0:
             return b""
 
@@ -763,7 +803,6 @@ class StreamClockTracker:
     @property
     def ratio(self) -> float:
         return self._ratio
-
 
 class AlignedStreamBuffer:
     """按 server 时钟域时间戳对齐的音频流缓冲。

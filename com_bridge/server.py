@@ -1381,6 +1381,9 @@ class Server:
                     f"重同步={self.stats.get('resync_popped', 0)} "
                     f"carry丢帧={self.stats.get('carry_dropped_frames', 0)} "
                     f"★见底={self.stats.get('render_starved', 0)} "
+                    f"重采样积压={_pb._rs.backlog_frames if (_pb is not None and _pb._rs is not None) else 0}"
+                    f"(排空{getattr(_pb._rs, '_backlog_drains', 0) if (_pb is not None and _pb._rs is not None) else 0}"
+                    f"/回退{getattr(_pb._rs, '_backlog_resets', 0) if (_pb is not None and _pb._rs is not None) else 0}) "
                     f"最低padding={getattr(self, '_pad_min_frames', -1) if getattr(self, '_pad_min_frames', None) is not None else -1}帧 "
                     f"ratio={ratio:.5f} 到达率={arrival:.0f}",
                     flush=True,
