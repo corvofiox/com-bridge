@@ -216,6 +216,124 @@ class LoopbackCapture:
         # 注意: 不清 self._cap, 不 CoUninitialize —— 渲染线程可能仍在跑
 
 
+class BoundaryFader:
+    """在「有声 <-> 静音」的边界处加短淡入/淡出，消除起播/停止的爆音。
+
+    ★ 用户实测症状(2026-10-21): "开始播放声音和结束播放声音的那一刻会
+      小爆一下"。这是**采样级跳变**: 音乐突然变成数字零(或反之)时,
+      扬声器从某个非零波形值一步跳到 0 —— 就是一声 pop。它与"周期性
+      断口"是两个独立问题, 必须分别处理。
+
+    ★ 实现要点: 淡出需要**知道后面是不是静音**, 所以必须把尾部
+      FADE 帧暂不外发(延迟一个淡入淡出长度的 FIFO)。这样:
+        - 下一块是静音 -> 先把暂存的尾巴按余弦淡出, 再放静音;
+        - 下一块恢复有声 -> 静音后紧跟的有声块按余弦淡入;
+        - 状态不变 -> 暂存尾巴原样发出, 正常数据零改动。
+      代价: 端到端多 FADE 帧延迟(默认 5ms), 对已含 60ms 抖动缓冲的
+      音频链路可忽略。
+    """
+
+    def __init__(self, channels: int, block_align: int, bits: int,
+                 fade_ms: float = 5.0, rate: int = 48000,
+                 silent_rms: float = 1e-3):
+        self.channels = channels
+        self.block_align = block_align
+        self.bits = bits
+        self.rate = rate
+        self.fade_frames = max(8, int(rate * fade_ms / 1000.0))
+        self.silent_rms = silent_rms
+        self._hold = b""              # 尚未发出的尾部(原始字节)
+        self._was_silent = True       # 上一块是否为静音
+        self.fades_out = 0            # 诊断: 淡出次数
+        self.fades_in = 0             # 诊断: 淡入次数
+
+    # -- 内部 ----------------------------------------------------------
+    def _frames(self, pcm: bytes):
+        np = _np()
+        if self.bits == 32:
+            return np.frombuffer(pcm, dtype="<f4").reshape(-1, self.channels)
+        return (np.frombuffer(pcm, dtype="<i2")
+                .astype(np.float32).reshape(-1, self.channels) / 32768.0)
+
+    def _bytes(self, arr) -> bytes:
+        np = _np()
+        if self.bits == 32:
+            return arr.astype("<f4").tobytes()
+        return (np.clip(arr, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+
+    def _is_silent(self, arr) -> bool:
+        np = _np()
+        if arr.size == 0:
+            return True
+        return float(np.sqrt(np.mean(arr.astype(np.float64) ** 2))) \
+            < self.silent_rms
+
+    @staticmethod
+    def _ramp(n: int, rising: bool):
+        np = _np()
+        # 升余弦: 0->1(rising) 或 1->0(falling), 两端导数为 0, 无拐角
+        t = np.linspace(0.0, np.pi, n, dtype=np.float32)
+        r = (1.0 - np.cos(t)) * 0.5 if rising else (1.0 + np.cos(t)) * 0.5
+        return r[:, None].astype(np.float32)
+
+    # -- 对外 ----------------------------------------------------------
+    def push(self, pcm: bytes) -> bytes:
+        """喂入新数据, 返回**现在可以安全写入设备**的 PCM(可能为空)。"""
+        np = _np()
+        if not pcm:
+            return b""
+        cur = self._frames(pcm)
+        now_silent = self._is_silent(cur)
+        out_parts: list[bytes] = []
+
+        hold = self._frames(self._hold) if self._hold else None
+        if hold is not None and hold.size:
+            if self._was_silent and not now_silent:
+                # 静音 -> 有声: 暂存的静音原样放, 新数据要淡入
+                out_parts.append(self._bytes(hold))
+                n = min(self.fade_frames, cur.shape[0])
+                cur = cur.copy()
+                cur[:n] = cur[:n] * self._ramp(n, rising=True)
+                self.fades_in += 1
+            elif (not self._was_silent) and now_silent:
+                # 有声 -> 静音: 暂存的尾巴必须淡出
+                n = min(self.fade_frames, hold.shape[0])
+                h = hold.copy()
+                if n > 0:
+                    h[-n:] = h[-n:] * self._ramp(n, rising=False)
+                out_parts.append(self._bytes(h))
+                self.fades_out += 1
+            else:
+                out_parts.append(self._bytes(hold))
+
+        self._was_silent = now_silent
+        # 新的尾部暂存起来(等下一块决定淡入/淡出)
+        if cur.shape[0] <= self.fade_frames:
+            self._hold = self._bytes(cur)
+            return b"".join(out_parts)
+        head = cur[:-self.fade_frames]
+        self._hold = self._bytes(cur[-self.fade_frames:])
+        out_parts.append(self._bytes(head))
+        return b"".join(out_parts)
+
+    def flush(self) -> bytes:
+        """把暂存的尾巴放掉(停止渲染时调用)。"""
+        out = self._hold
+        self._hold = b""
+        return out
+
+
+_np_cache: list = []
+
+
+def _np():
+    """惰性拿 numpy(本模块多处需要, 统一入口避免重复 import 开销)。"""
+    if not _np_cache:
+        import numpy as np
+        _np_cache.append(np)
+    return _np_cache[0]
+
+
 class LoopbackRenderer:
     """向本机默认渲染端点写数据(用于主电脑把混音结果输出)。"""
 

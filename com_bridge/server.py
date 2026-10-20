@@ -874,11 +874,21 @@ class Server:
         """
         self._starve_pad_frames = self.STARVE_PAD_FRAMES
         self._pad_min_frames = None
+        # ★ 边界淡入淡出器(消除起播/停止的 pop), 见 BoundaryFader 的说明
+        from .audio import BoundaryFader
+        self._fader: BoundaryFader | None = None
         # ★ 音频渲染线程提权(见 clock.raise_audio_thread_priority 的说明)
         from .clock import raise_audio_thread_priority
         print(f"[server] 渲染线程优先级: {raise_audio_thread_priority()}",
               flush=True)
         self._ren.start()
+        self._fader = BoundaryFader(
+            channels=self._ren.channels,
+            block_align=self._ren.block_align,
+            bits=self._ren.bits,
+            rate=self._ren.rate,
+            fade_ms=5.0,
+        )
         with self._lock:
             self._peer = AlignedStreamBuffer(
                 channels=self._ren.channels,
@@ -1275,15 +1285,27 @@ class Server:
                                                    render_target - padding))
                                         * block)
                     if silent:
-                        self.stats["silence_frames"] = \
-                            self.stats.get("silence_frames", 0) + \
-                            self._ren.write(silent)
+                        # ★ 静音填充也要经过 fader: 否则 fader 里暂存的
+                        #   5ms 尾巴会被直接丢掉, 且"音乐->静音"没有淡出,
+                        #   照样是一声 pop。
+                        s_out = self._fader.push(silent) \
+                            if self._fader is not None else silent
+                        if s_out:
+                            self.stats["silence_frames"] = \
+                                self.stats.get("silence_frames", 0) + \
+                                self._ren.write(s_out)
                 time.sleep(0.004)
                 continue
 
             empty_since = None
-            written = self._ren.write(peer)
-            self.stats["rendered_frames"] += written
+            # ★★★ 边界淡入淡出: 消除"起播/停止那一刻的小爆音"。
+            #   用户实测: "开始播放声音和结束播放声音的那一刻会小爆一下"
+            #   —— 那是音乐↔数字零之间的采样级跳变。fader 会暂存 5ms 尾巴,
+            #   等看到下一块再决定是否淡出/淡入(代价: 5ms 额外延迟)。
+            shaped = self._fader.push(peer) if self._fader is not None else peer
+            if shaped:
+                written = self._ren.write(shaped)
+                self.stats["rendered_frames"] += written
             time.sleep(0.002)
 
             # ★★★ 周期性诊断快照(每 5 秒一行) —— 排障必须靠数据, 不能猜。
