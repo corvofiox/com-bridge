@@ -1077,12 +1077,23 @@ class AlignedStreamBuffer:
             #   窗口拉长到 4s 后噪声按 √N 下降到 ±0.35%, 再叠加 EWMA 平滑
             #   (α=0.3)可到 ±0.1% 量级, 足以支撑前馈。
             if span >= self.RATE_WINDOW_S:
-                # 丢弃第一个完整窗口: 起播时 agent 会预发一批数据把水位
-                # 垫满, 那一瞬间的到达率会虚高, 采信它会把队列抽干。
+                inst = self._rate_frames / span
+                # ★★★ 2026-10-21: **钳制到合理范围**再喂养前馈。
+                #   实测启动阶段的窗口读数只有 26000~42000(远低于 48000):
+                #   连接握手、采集线程起来、首批缓冲回填都会让前 1~2 个
+                #   窗口严重偏低。若不钳制, ratio_ff 会被拖到 0.55, 而 ratio
+                #   下限是 0.985 -> 控制器"故意放慢消费" -> 水位降不下来,
+                #   一直压在削波阈值上 -> 持续丢样本 -> 持续爆音, 几十秒后
+                #   读数收敛才恢复(正是用户描述的"刚连接时离谱、随后好转")。
+                #   设备晶振失配实际不可能超过 ±2%, 超出部分一律视为测量噪声。
+                lo, hi = 0.98 * self.rate, 1.02 * self.rate
+                inst = min(max(inst, lo), hi)
                 if self._rate_windows >= 1:
-                    inst = self._rate_frames / span
                     self._arrival_rate = (0.7 * self._arrival_rate + 0.3 * inst
                                           if self._arrival_rate > 0 else inst)
+                else:
+                    # 第一个窗口仍然丢弃: 它最容易受启动突发影响。
+                    pass
                 self._rate_windows += 1
                 self._rate_t0 = now
                 self._rate_frames = 0

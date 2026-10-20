@@ -129,6 +129,15 @@ class Server:
     #   这是主机侧唯一**确定性**的断口判据(见 _render_loop 的说明)。
     STARVE_PAD_FRAMES = 96
 
+    # ★ 起播前等待启动突发落定的时间(秒)。见 _render_loop 起播段说明:
+    #   连接瞬间 agent 会把采集缓冲存量一次性发来, 等它到齐再开播,
+    #   就能在"一声未出"的状态下把多余水位抹平, 避免起播阶段的持续削波。
+    PRIME_SETTLE_S = 0.6
+
+    # ★ 启动宽限期内**禁止削波**(秒)。削波=丢真实样本=可听咔哒, 而启动
+    #   阶段前馈还没收敛, 水位本来就偏高; 此时削波是纯损失。
+    TRIM_WARMUP_S = 20.0
+
     # (已废弃 2026-10-20) KBD_LEAK_REINSTALL_LIMIT 连同"RawInput 键盘泄漏
     #   检测"整体移除: 物理按键实测证明其判据错误(hider 持前台 + 键盘
     #   RawInput 并存时, 钩子收不到键是系统正常行为, 不是钩子坏)。
@@ -874,6 +883,9 @@ class Server:
         """
         self._starve_pad_frames = self.STARVE_PAD_FRAMES
         self._pad_min_frames = None
+        # 起播等待用(见 _render_loop 的起播段说明)
+        self._peer_first_mono = 0.0
+        self._prime_level = 0.0
         # ★ 边界淡入淡出器(消除起播/停止的 pop), 见 BoundaryFader 的说明
         from .audio import BoundaryFader
         self._fader: BoundaryFader | None = None
@@ -991,11 +1003,37 @@ class Server:
                     #   这里要求队列至少有一包数据(约 20ms), 保证首帧就是
                     #   真实音频而不是静音。若 1s 内没有数据(对端未起播),
                     #   也照常进入渲染循环(写静音由 empty_since 分支负责)。
+                    # ★★★ 起播时机(2026-10-21 重做, 修"刚连接水位上涨->爆音"):
+                    #   旧逻辑是"队列里有一包就开播", 于是开播后 agent 才把
+                    #   采集缓冲里的存量(~100ms)灌进来, 水位冲高并一直压在
+                    #   削波阈值之上, trim_to 持续丢样本 -> 持续爆音, 要靠
+                    #   ratio 慢慢排 40 秒才安静(用户描述的现象)。
+                    #   新做法: **等启动突发落定再开播** —— 至少等
+                    #   PRIME_SETTLE_S 秒, 且队列不再明显增长; 开播前把
+                    #   多余水位一次性抹平。此刻设备缓冲还是空的(一声未出),
+                    #   所以丢样本完全不可闻。
+                    if not primed and level_ms > 0:
+                        if self._peer_first_mono == 0.0:
+                            self._peer_first_mono = time.monotonic()
+                        _settle = time.monotonic() - self._peer_first_mono
+                        _growing = level_ms > getattr(self, "_prime_level", 0) + 3
+                        self._prime_level = level_ms
+                        if _settle < self.PRIME_SETTLE_S or _growing:
+                            self._peer_priming = round(level_ms, 1)
+                            time.sleep(0.01)
+                            continue
                     if level_ms > 0 or \
                             time.monotonic() - self._start_mono > 1.0:
                         primed = True
                         print(f"[server] 开始渲染(队列 {level_ms:.0f}ms)",
                               flush=True)
+                        if level_ms > self.jitter_ms * 1.5 and peer_buf:
+                            _snap = peer_buf.trim_to(self.jitter_ms,
+                                                    max_skip_ms=1000.0)
+                            level_ms = peer_buf.buffered_ms()
+                            print(f"[server] 起播抹平: 丢弃 {_snap} 帧启动"
+                                  f"积压(此时尚未出声, 不可闻), "
+                                  f"水位 -> {level_ms:.0f}ms", flush=True)
                     else:
                         self._peer_priming = round(level_ms, 1)
                         time.sleep(0.005)
@@ -1192,7 +1230,16 @@ class Server:
                 #   读数下把 ratio 压向 0.985(消耗更慢), 形成正反馈。
                 #   所以维持 1.8×, 让削波及时把水位压回目标。
                 soft_ms = self.jitter_ms * 1.8
-                if peer_buf is not None and level_ms > soft_ms:
+                # ★★★ 启动宽限: **还没测出到达率之前不许削波**。
+                #   削波(trim_to)是丢真实样本 -> 每丢一次就是一声爆音。
+                #   刚连接时前馈尚未收敛(见 audio.note_packet 的说明),
+                #   水位会短暂冲高; 此时若立刻开削, 用户听到的就是
+                #   "刚连上一直爆音, 过一会儿自己好"。
+                #   等 arrival_rate 有读数(说明前馈已接管)且过了启动宽限
+                #   时间, 再允许削波 —— 削波是丢样本, 早期触发必然被听见。
+                _warmup = time.monotonic() - self._start_mono < self.TRIM_WARMUP_S
+                if (peer_buf is not None and level_ms > soft_ms
+                        and arrival > 0 and not _warmup):
                     # ★ max_skip_ms = **0.5ms**(24 帧): 断口小到接近
                     #   听不见(0.5ms 的接缝在 1kHz 音上约半个周期,
                     #   听感是极轻的"沙"); 同时每轮都削, 每秒最多
