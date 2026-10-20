@@ -86,6 +86,37 @@ def disable_high_res_timer() -> None:
         pass
 
 
+def raise_audio_thread_priority() -> str:
+    """把**当前线程**提到音频级优先级(Windows), 返回结果描述。
+
+    ★ 为什么必须做(2026-10-21):
+      渲染/采集循环是 Python 轮询线程, 每 2ms 醒一次写一小块。
+      只要 GIL 被别的线程(剪贴板/托盘/焦点监控/hider 100ms 保活)占住
+      数十毫秒, 本线程就写不进去 -> 声卡缓冲周期性见底 -> 可听爆音。
+      用户症状正是"周期性、不固定、每次持续 1~10 秒"。
+      把线程优先级提上去, 能让调度器优先给它 CPU(虽不能完全绕开 GIL,
+      但能显著缩短被抢占的时间)。
+      用 TIME_CRITICAL 有风险(极端情况下会饿死界面), 因此取 HIGHEST。
+    """
+    try:
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        # ★★★ 必须声明返回类型: 默认 restype=c_int 会把 x64 的线程句柄
+        #   **截断成 32 位**, SetThreadPriority 拿着错误句柄必然返回 0
+        #   (实测就是这么失败的。本项目已被同类 ctypes 问题咬过多次:
+        #    重复声明结构体/漏 argtypes, 症状永远很隐晦)。
+        kernel32.GetCurrentThread.restype = wintypes.HANDLE
+        kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+        kernel32.SetThreadPriority.restype = wintypes.BOOL
+        THREAD_PRIORITY_HIGHEST = 2
+        h = kernel32.GetCurrentThread()
+        ok = kernel32.SetThreadPriority(h, THREAD_PRIORITY_HIGHEST)
+        return "已提升到 HIGHEST" if ok else "提升失败(SetThreadPriority=0)"
+    except (AttributeError, OSError) as exc:  # noqa: BLE001
+        return f"提升失败: {exc}"
+
+
 @dataclass
 class ClockSync:
     """单向对时结果。"""

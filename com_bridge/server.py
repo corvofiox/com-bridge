@@ -124,6 +124,11 @@ class Server:
     # 只把"光标跟着物理鼠标明显移动"当作摘钩证据。
     HOOK_PROBE_TOLERANCE_PX = 2
 
+    # ★ WASAPI 渲染缓冲"见底"阈值(帧, 48kHz 下 96 帧 = 2ms)。
+    #   padding 低于它 => 设备随时可能在我写入前读空 => 可听咔哒。
+    #   这是主机侧唯一**确定性**的断口判据(见 _render_loop 的说明)。
+    STARVE_PAD_FRAMES = 96
+
     # (已废弃 2026-10-20) KBD_LEAK_REINSTALL_LIMIT 连同"RawInput 键盘泄漏
     #   检测"整体移除: 物理按键实测证明其判据错误(hider 持前台 + 键盘
     #   RawInput 并存时, 钩子收不到键是系统正常行为, 不是钩子坏)。
@@ -823,6 +828,35 @@ class Server:
                 self.stats["peer_rejected"] = self.stats.get("peer_rejected", 0) + 1
                 return
             # ts 已在 agent 侧换算到 server 时钟域, 直接入队
+            # ★★★ 入站时间线连续性检查(2026-10-21 新增)
+            #   "上一包 ts + 上一包时长 == 本包 ts" 必须成立(副机按帧偏移
+            #   打戳)。不成立只有两种可能:
+            #     delta > 0 -> 中间这段数据**没到**(丢包/被丢弃) -> 断口
+            #     delta < 0 -> 重复/乱序投递
+            #   两种情况都会在播放流里留下缺口 = 可听咔哒。
+            #   ★ 这是"副机打戳之后到主机入队之前"唯一能抓住丢数据的判据;
+            #     若它恒为 0, 说明入站流严格连续, 断口不在这段路径。
+            _frames_in = len(pcm) // self._ren.block_align
+            _prev_ts = getattr(self, "_prev_in_ts", 0)
+            if _prev_ts:
+                _exp = _prev_ts + int(
+                    getattr(self, "_prev_in_frames", 0) * 1_000_000
+                    / self._ren.rate)
+                _d_us = hdr.ts_us - _exp
+                _ad = abs(_d_us)
+                if _ad > getattr(self, "_in_max_delta_us", 0):
+                    self._in_max_delta_us = _ad
+                if _ad > 3000:            # >3ms 视为真实断口
+                    self.stats["in_ts_gaps"] = \
+                        self.stats.get("in_ts_gaps", 0) + 1
+                    _n = self.stats["in_ts_gaps"]
+                    if _n <= 5 or _n % 50 == 0:
+                        print(f"[server] !! 入站时间线断口(第 {_n} 次): "
+                              f"ts 偏差={_d_us / 1000.0:+.1f}ms "
+                              f"(上一包 {getattr(self, '_prev_in_frames', 0)} 帧)",
+                              flush=True)
+            self._prev_in_ts = hdr.ts_us
+            self._prev_in_frames = _frames_in
             self._peer.push(hdr.ts_us, pcm)
             self._peer.note_packet(hdr.ts_us, len(pcm) // self._ren.block_align)
 
@@ -838,6 +872,12 @@ class Server:
           混音在声卡端点里由 Windows 完成(acoustic mixing)。
           这样本机音频零额外延迟, 副电脑音频才付抖动缓冲的代价。
         """
+        self._starve_pad_frames = self.STARVE_PAD_FRAMES
+        self._pad_min_frames = None
+        # ★ 音频渲染线程提权(见 clock.raise_audio_thread_priority 的说明)
+        from .clock import raise_audio_thread_priority
+        print(f"[server] 渲染线程优先级: {raise_audio_thread_priority()}",
+              flush=True)
         self._ren.start()
         with self._lock:
             self._peer = AlignedStreamBuffer(
@@ -950,6 +990,36 @@ class Server:
                         self._peer_priming = round(level_ms, 1)
                         time.sleep(0.005)
                         continue
+                # ★★★ 真·断口判据(2026-10-21 新增): **WASAPI 渲染缓冲见底**。
+                #
+                #   为什么必须单独统计这一项(此前所有指标都不覆盖它):
+                #     队列水位 / ratio / 欠载 / 丢包 全都是**间接**指标; 而
+                #     设备里真正排队待播的样本量是 `padding`。padding 一旦
+                #     触到 0, WASAPI 共享模式就会播放静音或重复上一小段
+                #     —— 那就是用户听到的"咔哒/噼啪", 100% 可听。
+                #     所以: **只要 render_starved 在涨, 断口就在主机侧渲染,
+                #     与网络/副机无关**; 若它恒为 0 却仍在响, 断口就一定来自
+                #     送进来的 PCM 内容本身(源头或传输), 排查方向立刻二分。
+                #
+                #   阈值取 2ms(96 帧): 低于它设备随时可能在我写入前读空。
+                #   启动/起播阶段(primed 刚为真)不算, 用 start 后的宽限跳过。
+                if time.monotonic() - self._start_mono > 2.0:
+                    _pad_min = getattr(self, "_pad_min_frames", None)
+                    if _pad_min is None or padding < _pad_min:
+                        self._pad_min_frames = padding
+                    if padding <= self._starve_pad_frames:
+                        self.stats["render_starved"] = \
+                            self.stats.get("render_starved", 0) + 1
+                        self.stats["render_starved_pad"] = padding
+                        # 只在首次与每 50 次打印, 避免刷屏
+                        _n = self.stats["render_starved"]
+                        if _n == 1 or _n % 50 == 0:
+                            print(f"[server] !! 渲染缓冲见底(第 {_n} 次): "
+                                  f"padding={padding}帧 "
+                                  f"({padding * 1000 / max(1, self._ren.rate):.1f}ms) "
+                                  f"peer水位={level_ms:.0f}ms "
+                                  f"空转={getattr(self, '_render_empty_loops', 0)}",
+                                  flush=True)
                 # ── 漂移补偿: 前馈为主 + 慢速修正 ──────────────────────
                 #
                 # resampler 语义(已用数值实验确认):
@@ -1106,6 +1176,11 @@ class Server:
                 #   幅度就被削掉, 而不是等到 90/240ms。削得越早, 每次要削
                 #   的量越小, 断口越不明显; 且水位不会呈现"缓慢爬升-突然
                 #   掉落"的锯齿, 听感更稳定。
+                # ★ 软阈值取 **1.8× 目标**(60ms -> 108ms)。
+                #   曾试过放宽到 3.0× 以减少"丢样本造成的咔哒", 但实测
+                #   (纯音 20s)水位会一路涨到 180ms 并卡住: 前馈项在低到达率
+                #   读数下把 ratio 压向 0.985(消耗更慢), 形成正反馈。
+                #   所以维持 1.8×, 让削波及时把水位压回目标。
                 soft_ms = self.jitter_ms * 1.8
                 if peer_buf is not None and level_ms > soft_ms:
                     # ★ max_skip_ms = **0.5ms**(24 帧): 断口小到接近
@@ -1153,21 +1228,30 @@ class Server:
                     #   下一轮(不丢), 而不是硬切。
                     if peer is not None:
                         max_bytes = max(0, avail) * block
+                        carry = getattr(self, "_render_carry", b"") or b""
+                        if carry:
+                            # ★★★ 残留**优先且完整**地排在前面(保持顺序)。
+                            #   历史 bug: 旧代码在 len(peer)>max_bytes 时直接
+                            #   `self._render_carry = peer[max_bytes:]` —— 那是
+                            #   **赋值, 会把上一轮残留原地丢弃**, 播放流随即
+                            #   出现断口(咔哒)。现在改成"先拼旧残留, 再整体
+                            #   截断到本轮可写量, 剩余继续顺延"。
+                            peer = carry + peer
                         if len(peer) > max_bytes:
-                            # ★★★ carry 覆盖丢弃计数: 被覆盖的尾部是**真实
-                            #   音频样本**, 每次覆盖 = 一次波形断口(咔哒)。
-                            #   此前此路径无任何统计, 快照全部正常也照样响。
-                            self.stats["carry_dropped_frames"] = \
-                                self.stats.get("carry_dropped_frames", 0) + \
-                                (len(peer) - max_bytes) // block
                             self._render_carry = peer[max_bytes:]
                             peer = peer[:max_bytes]
-                        elif getattr(self, "_render_carry", b""):
-                            # 上一轮的残留优先补上(保持顺序)
-                            carry = self._render_carry
-                            head = min(len(carry), max(0, avail) * block)
-                            peer = carry[:head] + peer
-                            self._render_carry = carry[head:] or b""
+                        else:
+                            self._render_carry = b""
+                        # ★ 兜底上限: 正常不会触发(上游产出速率受控)。
+                        #   若真的累积超过 ~400ms, 说明出现持续失配, 此时
+                        #   丢**最旧**的(而不是最新的), 让延迟不无界增长。
+                        _cap = int(self._ren.rate * 0.4) * block
+                        if len(self._render_carry) > _cap:
+                            _drop = len(self._render_carry) - _cap
+                            self._render_carry = self._render_carry[_drop:]
+                            self.stats["carry_dropped_frames"] = \
+                                self.stats.get("carry_dropped_frames", 0) + \
+                                _drop // block
                         if not peer:
                             peer = None
 
@@ -1227,9 +1311,13 @@ class Server:
                     f"静音帧={self.stats.get('silence_frames', 0)} "
                     f"重同步={self.stats.get('resync_popped', 0)} "
                     f"carry丢帧={self.stats.get('carry_dropped_frames', 0)} "
+                    f"★见底={self.stats.get('render_starved', 0)} "
+                    f"最低padding={getattr(self, '_pad_min_frames', -1) if getattr(self, '_pad_min_frames', None) is not None else -1}帧 "
                     f"ratio={ratio:.5f} 到达率={arrival:.0f}",
                     flush=True,
                 )
+                # 最低 padding 每 5 秒清零, 让下一个窗口重新取最小值
+                self._pad_min_frames = None
                 # ★★★ 第二行: **真丢包/时序**统计 —— 本地闭环永远测不出
                 #   网络丢包(UDP 无重传, 每丢 1 个 2.5ms 的包 = 1 个咔哒,
                 #   周期性丢失 = 周期性噼啪), 必须在真机上看。
@@ -1238,9 +1326,12 @@ class Server:
                     print(
                         f"[server] 丢包: 累计丢={_rx.lost} 重复={_rx.dupes} "
                         f"重启={_rx.resyncs} "
+                        f"★入站断口={self.stats.get('in_ts_gaps', 0)} "
+                        f"最大偏差={getattr(self, '_in_max_delta_us', 0.0) / 1000.0:.1f}ms "
                         f"carry滞留={len(getattr(self, '_render_carry', b'') or b'') // block}",
                         flush=True,
                     )
+                    self._in_max_delta_us = 0.0
         self._ren.stop()
 
     # -- 输入 ----------------------------------------------------------

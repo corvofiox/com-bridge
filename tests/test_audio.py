@@ -149,7 +149,12 @@ class TestAlignedStreamBuffer:
         # 队列有数据就取, 不看 ts
         out = b.pop_aligned(ts, 480)
         assert out is not None
-        assert len(out) // 8 == 480
+        # ★ 2026-10-21: 现在**总是**经过 Resampler(修掉"ratio≈1 时旁路,
+        #   切回时会重放已播过的残留样本 -> 咔哒"的 bug)。重采样器会保留
+        #   约 96 帧的抽头尾窗, 所以单次产出可能略少于输入; 契约是
+        #   "不超过预算且不丢样本", 不再要求单次等量。
+        got = len(out) // 8
+        assert 0 < got <= 480, f"取了 {got} 帧, 超出预算 480"
         # 取空后再取 → underrun
         assert b.pop_aligned(ts + 60_000, 480) is None
 
@@ -179,17 +184,25 @@ class TestAlignedStreamBuffer:
         assert got <= total_in
 
     def test_oversized_chunk_is_split_not_dropped(self):
-        """块大于预算时必须切分保留余量, 而不是整块丢弃。"""
+        """块大于预算时不得超出预算, 且**样本必须守恒**(只是顺延到后续轮)。
+
+        ★ 2026-10-21: 现在总是经过 Resampler(修掉旁路切换重放残留的 bug),
+        而重采样器保留约 96 帧抽头尾窗, 所以**单轮**产出可能少于预算;
+        真正要锁死的是"多轮累计不丢样本"。
+        """
         b = self._buf(target_ms=0.0)
         ts = 1_000_000
         b.push(ts, pcm_frames(np.zeros(960)))
-        out1 = b.pop_aligned(ts + 10_000, 400)
-        assert len(out1) // 8 == 400
-        out2 = b.pop_aligned(ts + 10_000, 400)
-        assert len(out2) // 8 == 400
-        out3 = b.pop_aligned(ts + 10_000, 400)
-        assert len(out3) // 8 == 160           # 960 - 400 - 400
-        assert b.pop_aligned(ts + 10_000, 400) is None
+        got = 0
+        for _ in range(20):
+            out = b.pop_aligned(ts + 10_000, 400)
+            if out is None:
+                break
+            n = len(out) // 8
+            assert n <= 400, f"单轮取了 {n} 帧, 超出预算 400"
+            got += n
+        # 960 帧全部产出(允许重采样器尾窗 <=96 帧的余量未吐出)
+        assert 960 - 96 <= got <= 960, f"累计产出 {got} 帧, 样本未守恒"
 
     def test_pop_any_also_honors_budget(self):
         b = self._buf()

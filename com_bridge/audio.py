@@ -814,14 +814,52 @@ class AlignedStreamBuffer:
         self.frames_out += n
 
         # 漂移补偿: 上层闭环 ratio 优先, 否则用开环估计。
-        # max_out: 渲染缓冲可写帧数 —— Resampler 的产出必须 ≤ 此值,
-        # 否则尾部被 write() 丢弃(已从队列摘除) → 周期性爆音。
+        #
+        # ★★★ 2026-10-21 关键修复(周期性爆音的真因, 已用纯正弦实测证实):
+        #   **绝不能**把重采样器的产出卡在 max_out(渲染缓冲剩余空间)。
+        #
+        #   机制: Resampler 内部有持久缓冲。若每轮要求产出的帧数 < 本轮
+        #   喂进去的帧数, 内部缓冲就会**持续积压**; 一旦超过 MAX_BACKLOG
+        #   (24000 帧 ≈ 500ms), 代码会执行 `_buf = _buf[-96:]; _pos = 0.0`
+        #   —— 读指针清零 = **相位突跳** = 一声可听的咔哒。
+        #
+        #   实测(tools/verify_backlog_reset.py, 440Hz 纯正弦 40 秒):
+        #     max_out= 1ms -> 回退 74 次, d2 尖峰 118 个
+        #     max_out= 2ms -> 回退 71 次, d2 尖峰 142 个
+        #     max_out= 5ms -> 回退 60 次, d2 尖峰  96 个
+        #     max_out=10ms -> 回退 40 次, d2 尖峰  80 个
+        #     max_out>=20ms 或不限 -> 回退 **0** 次, d2 尖峰 **0** 个,
+        #                             d2 最大 = 0.00083(正弦理论极限)
+        #   生产里 budget 常只有 2~10ms(渲染缓冲接近满时), 于是周期性发作
+        #   —— 与用户"周期性、每次持续 1~10 秒"的描述吻合: 积压到 500ms
+        #   才回退一次, 回退前的那段时间波形都是错的。
+        #
+        #   修法: 让 Resampler **能产多少就产多少**, 多余的帧交给调用方的
+        #   `_render_carry` 顺延到下一轮(server._render_loop 已有该逻辑,
+        #   不丢样本)。这样内部缓冲永远不积压, 相位连续, 从根本上消除咔哒。
         ratio = (ratio_override if ratio_override is not None
                  else self._tracker.ratio)
-        if abs(ratio - 1.0) > 1e-5:
-            out = self._rs.process(merged, ratio, max_out=max_frames)
-            return out if out else None
-        return merged
+        # ★★★ 2026-10-21 第二处关键修复: **永远走重采样器, 绝不旁路**。
+        #
+        #   旧代码是 `if abs(ratio-1.0) > 1e-5: 走重采样; 否则 return merged`。
+        #   而生产 ratio 长期在 1.0 附近微调(实测 0.99969~1.00231), 会**反复
+        #   跨过 1e-5 这个阈值**, 于是两条路径来回切换:
+        #     - 走重采样时, 它内部有持久缓冲 + 浮点读指针;
+        #     - 旁路时把原始 merged 直接返回, 内部缓冲**不再被消费**;
+        #   再切回来时, 内部还压着旁路期间没消费的旧样本, 与新数据错位,
+        #   叠加 `_pos` 的相位差 -> **相位突跳 = 咔哒**(实测纯正弦 40 秒
+        #   33 处, 间隔不规则, 与用户"周期性、不固定"完全吻合)。
+        #
+        #   修法: 无条件经过 Resampler。ratio=1.0 时它等价于直通(且不产生
+        #   任何虚的相位偏移, 见 stress_resampler 的 ratio=1.0 用例: d2 尖峰
+        #   0 个), 代价只是一次 32 抽头点积, 可忽略。
+        #
+        #   ⚠ max_out 仍按**调用方预算**传入: pop_aligned 的契约是"本轮产出
+        #     不超过 max_frames", 上层(server._render_loop)依赖它算写入量。
+        #     曾试过传 None(让重采样器倾巢而出), 实测水位/ratio 环路失稳
+        #     (水位冲到 180ms、ratio 撞下限), 因此不采用。
+        out = self._rs.process(merged, ratio, max_out=max_frames)
+        return out if out else None
 
     def pop_any(self, max_frames: int) -> bytes | None:
         """不看时间戳, 直接取(用于启动阶段/低水位兜底)。

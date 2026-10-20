@@ -346,6 +346,10 @@ class Agent:
         assert self._cap is not None and self._audio_tx is not None
         cap = self._cap
         cap.start()          # 必须在本线程调用(COM 线程亲和)
+        # ★ 采集线程提权(见 clock.raise_audio_thread_priority 的说明)
+        from .clock import raise_audio_thread_priority
+        print(f"[agent] 采集线程优先级: {raise_audio_thread_priority()}",
+              flush=True)
         print(
             f"[agent] loopback 就绪: {cap.channels}ch @{cap.rate}Hz {cap.bits}bit "
             f"buffer={cap.buffer_frames}帧"
@@ -439,6 +443,39 @@ class Agent:
                 continue
             self._silence_ticks = 0
             pcm, flags, qpc = r
+            # ★★★ qpc 时间线连续性检查(2026-10-21 新增) —— 直接判"源头是否丢数据"。
+            #
+            #   为什么它是决定性的:
+            #     `qpc` 是 WASAPI 给的**设备时钟位置**(100ns), 按采样率严格
+            #     线性推进。"上一包 qpc + 上一包帧数对应的时长 == 本包 qpc"
+            #     这个等式在设备连续供数时必须成立。一旦不等:
+            #       delta > 0 -> 中间有数据没被我们取到(被丢弃/覆盖)= 源头丢帧
+            #       delta < 0 -> 重复投递
+            #     两者都会让主机侧时间轴出现断口 -> 可听咔哒。
+            #   它比"实供=1000ms/s"之类平均值灵敏得多: 平均值会把偶发丢帧
+            #   摊薄到看不见, 而 qpc 差值逐包可比。
+            #   ★ 若此计数恒为 0, 即可**确定**副机采集端没有丢数据。
+            _frames_now = len(pcm) // cap.block_align
+            _prev_qpc = getattr(self, "_prev_qpc", 0)
+            _prev_qf = getattr(self, "_prev_qpc_frames", 0)
+            if qpc and _prev_qpc:
+                _exp = _prev_qpc + int(_prev_qf * 10_000_000 / cap.rate)
+                _d = int(qpc) - _exp
+                _d_us = abs(_d) / 10.0            # 100ns -> us
+                if _d_us > getattr(self, "_max_qpc_delta_us", 0.0):
+                    self._max_qpc_delta_us = _d_us
+                if _d_us > 3000.0:                # >3ms 视为真实断口
+                    self.stats["qpc_gaps"] = \
+                        self.stats.get("qpc_gaps", 0) + 1
+                    if self.stats["qpc_gaps"] <= 5 or \
+                            self.stats["qpc_gaps"] % 50 == 0:
+                        print(f"[agent] !! 采集时间线断口(第 "
+                              f"{self.stats['qpc_gaps']} 次): "
+                              f"qpc 偏差={_d / 10.0:+.1f}ms "
+                              f"(上一包 {_prev_qf} 帧)", flush=True)
+            if qpc:
+                self._prev_qpc = int(qpc)
+                self._prev_qpc_frames = _frames_now
             # ★★★ 静音包**必须照发**, 不能丢(2026-10-19 修正)。
             #
             #   旧实现 `if flags & 0x2: continue` 把静音包直接扔掉。
@@ -552,10 +589,14 @@ class Agent:
                     f"读次数={cap.read_calls} "
                     f"实供={_avg_ms:.0f}ms/s "
                     f"需要={1000.0:.0f}ms/s "
-                    f"静包={self.stats.get('silence_sent', 0)}"
+                    f"静包={self.stats.get('silence_sent', 0)} "
+                    f"★时间线断口={self.stats.get('qpc_gaps', 0)} "
+                    f"最大偏差={getattr(self, '_max_qpc_delta_us', 0.0):.1f}ms"
                     f"{_clk}",
                     flush=True,
                 )
+                # ★ 快照窗口内的 qpc 最大偏差只反映本窗口, 归零重测
+                self._max_qpc_delta_us = 0.0
         cap.stop()
 
     def _tone_loop(self, cap, clock) -> None:
@@ -623,13 +664,19 @@ class Agent:
             frame_bytes = (4 if cap.bits == 32 else 2) * ch
             pkt_frames = frames_per_pkt
             off = 0
+            # ★★★ 时间戳必须**按帧偏移逐片推进**(2026-10-21 修复):
+            #   旧代码给同一批里的所有分片用同一个 now_us(), 于是相邻两片的
+            #   ts 差 ≈0, 而数据其实相差 20ms -> 接收端"入站时间线连续性"
+            #   判据每秒虚报 64 次断口(实测 5125→6085/5s), 还会让
+            #   head_lag_ms 判断失真、触发无谓的 pop_any 重同步。
+            base_ts = now_us()
+            if clock is not None and clock.synced:
+                base_ts = clock.local_to_remote(base_ts)
             while off < batch:
                 take = min(pkt_frames, batch - off)
                 b0 = off * frame_bytes
                 piece = pcm[b0: b0 + take * frame_bytes]
-                ts = now_us()
-                if clock is not None and clock.synced:
-                    ts = clock.local_to_remote(ts)
+                ts = base_ts + int(off * 1_000_000 / rate)
                 self._audio_tx.send(
                     piece, rate=rate, bits=cap.bits, channels=ch,
                     chan_mask=0x3, ts_us=ts,

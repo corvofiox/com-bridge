@@ -58,6 +58,56 @@ def write_line(text: str) -> None:
         pass
 
 
+class _TimestampedStream:
+    """把每一次 write 的内容按行加时间戳前缀(毫秒精度)。
+
+    ★ 为什么需要(2026-10-21, 排查音频爆音时被卡住):
+      日志原来**没有任何时间戳**, 于是"用户听到爆音的瞬间"与"日志里
+      水位/欠载/见底等计数"**无法对齐** —— 只能靠猜, 白白多花了几轮。
+      加前缀后, 任何一次现象都能用钟点时间直接定位到日志行。
+
+    只做最小实现: 缓冲到换行为止, 然后整行加前缀写出去。
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self._buf = ""
+
+    def write(self, s: str) -> int:
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            ts = time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
+            self._inner.write(f"{ts}  {line}\n")
+        return len(s)
+
+    def flush(self) -> None:
+        if self._buf:
+            ts = time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
+            self._inner.write(f"{ts}  {self._buf}\n")
+            self._buf = ""
+        try:
+            self._inner.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def isatty(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    def fileno(self):
+        return self._inner.fileno()
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self._inner, "encoding", "utf-8")
+
+    def __getattr__(self, item):
+        return getattr(self._inner, item)
+
+
 def install() -> str | None:
     """把 stdout/stderr 重定向到日志文件; 返回路径, 失败返回 None。
 
@@ -87,12 +137,12 @@ def install() -> str | None:
         import os as _os
         if _os.isatty(1) is False:
             # fd1 现在是日志文件: 用行缓冲的文本流包它
-            sys.stdout = io.open(1, "w", encoding="utf-8",
-                                  errors="replace", buffering=1,
-                                  closefd=False)
-            sys.stderr = io.open(2, "w", encoding="utf-8",
-                                  errors="replace", buffering=1,
-                                  closefd=False)
+            sys.stdout = _TimestampedStream(io.open(
+                1, "w", encoding="utf-8", errors="replace", buffering=1,
+                closefd=False))
+            sys.stderr = _TimestampedStream(io.open(
+                2, "w", encoding="utf-8", errors="replace", buffering=1,
+                closefd=False))
         return path
     except OSError:
         return None

@@ -542,9 +542,19 @@ class ComBridgeGui:
                 if role_kind == "server":
                     role = Server(name="server", side=side, jitter_ms=jitter)
                 else:
+                    # ★ 诊断开关: CB_TONE_HZ=440 时副机改为**合成正弦**并直接
+                    #   发送(跳过 WASAPI 采集)。用于把"爆音"分层定位:
+                    #     纯正弦仍爆音 -> 问题在传输/渲染/声卡
+                    #     纯正弦干净   -> 问题在副机的 loopback 采集
+                    #   纯正弦上人耳能立刻分辨爆音, 比音乐容易判断得多。
+                    import os as _os
+                    try:
+                        _tone = float(_os.environ.get("CB_TONE_HZ", "0") or 0)
+                    except ValueError:
+                        _tone = 0.0
                     role = Agent(server_host=host, name="agent",
                                  mute_local=True, discover_timeout_s=3.0,
-                                 side=side or "right")
+                                 side=side or "right", tone_hz=_tone)
                 role.start()
             except BaseException as exc:  # noqa: BLE001
                 # 这里必须用 BaseException 并保证通知一定会发出:
