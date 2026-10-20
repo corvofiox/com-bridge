@@ -103,6 +103,43 @@ user32.GetCapture.argtypes = []
 user32.GetCapture.restype = wintypes.HWND
 user32.ReleaseCapture.argtypes = []
 user32.ReleaseCapture.restype = wintypes.BOOL
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.c_void_p]
+user32.GetWindowRect.restype = wintypes.BOOL
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+kernel32.GetCurrentProcessId.restype = wintypes.DWORD
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+# 桌面/外壳窗口类名 —— 它们覆盖全屏但不是"全屏程序", 不能据此放弃抢前台。
+# 见 CursorHider._is_foreign_fullscreen。
+_SHELL_CLASSES = frozenset({
+    "Progman",          # 桌面
+    "WorkerW",          # 壁纸/桌面子窗口(视 Windows 版本而定)
+    "Shell_TrayWnd",    # 任务栏
+    "Shell_SecondaryTrayWnd",
+    "NotifyIconOverflowWindow",
+})
+
+
+def rect_covers(win, desk) -> bool:
+    """窗口矩形是否**完全覆盖**桌面矩形(纯函数, 可单测)。
+
+    两个矩形都用 (left, top, right, bottom)。判定"全屏"用"覆盖整个虚拟
+    桌面"而不是"等于某个显示器", 这样多显示器拼屏 + 最大化窗口也能正确
+    区分: 单个最大化窗口只覆盖一个显示器, 不会盖住整个虚拟桌面。
+    """
+    try:
+        wl, wt, wr, wb = win
+        dl, dt, dr, db = desk
+        return wl <= dl and wt <= dt and wr >= dr and wb >= db
+    except Exception:  # noqa: BLE001
+        return False
+
 
 
 def _set_cursor_visibility(visible: bool, attempts: int = 10) -> int:
@@ -173,6 +210,21 @@ class CursorHider:
         self._is_foreground = False
         # 前台被抢走的次数(保活定时器重夺计数)。>0 说明有程序在抢焦点。
         self._fg_regrabs = 0
+        # ★★★ 抢前台的**刹车**(2026-10-21 事故复盘新增)。
+        #   背景: 保活定时器每 100ms 检查一次前台, 丢了就 AttachThreadInput
+        #   + SetForegroundWindow 抢回来。这等于**我们永不放弃焦点** ——
+        #   对普通桌面程序无所谓, 但前台若是**全屏程序**(游戏 / 远程桌面
+        #   客户端 / 播放器), 抢走焦点会让它黑屏或停止出画, 而它每次想
+        #   拿回焦点又会被我们 100ms 后抢走 -> 永久黑屏 + 键鼠全无反应。
+        #   两个刹车:
+        #     1) 前台是**别的进程的全屏窗口**时, 干脆不抢(光标可能因此
+        #        保持可见 —— 用"看得见的光标"换"不全屏黑掉", 值得);
+        #     2) 连续抢 N 次仍抢不到(有程序比我们更凶), 就放弃本轮,
+        #        避免无限抢焦点的抖动。
+        self._give_up_steal = False
+        self._fg_fail_streak = 0
+        self._fg_steal_skipped = 0
+        self._fullscreen_skip_logged = False
         self._class_name = f"ComBridgeHider_{id(self):x}"   # 每实例唯一
 
     # -- 生命周期 ------------------------------------------------------
@@ -281,6 +333,11 @@ class CursorHider:
             #   或窗口是前台"时生效。丢了前台, 捕获随时会失效, 光标就
             #   重新出现 —— 这正是用户反复报的"光标没消失"。
             need_recover = False
+            # ★ 抢前台刹车(全屏他程序 / 连续抢不到) —— 一旦触发就**不再**
+            #   动前台与捕获, 直接返回: 继续抢只会制造抖动, 而光标可见
+            #   只是体验降级, 全屏程序被反复打断却是灾难性的。
+            if self._steal_disabled(hwnd):
+                return 0
             if user32.GetForegroundWindow() != hwnd:
                 fg = user32.GetForegroundWindow()
                 fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
@@ -304,6 +361,17 @@ class CursorHider:
                 self._is_foreground = (user32.GetForegroundWindow() == hwnd)
                 need_recover = True
                 self._fg_regrabs = getattr(self, "_fg_regrabs", 0) + 1
+                # 踩刹车②: 抢不到就别无休止地抢(见 __init__ 的说明)
+                if self._is_foreground:
+                    self._fg_fail_streak = 0
+                else:
+                    self._fg_fail_streak += 1
+                    if self._fg_fail_streak >= self.MAX_FG_STEAL_FAILS:
+                        self._give_up_steal = True
+                        print(f"[cursor] !! 连续 {self._fg_fail_streak} 次抢前台"
+                              f"失败(有更强势的程序在占焦点) -> 本轮穿越放弃"
+                              f"隐藏光标(本机光标会保持可见, 键鼠仍归副机)",
+                              flush=True)
             if user32.GetCapture() != hwnd:
                 self._capture_changed += 1
                 user32.SetCapture(hwnd)
@@ -401,6 +469,69 @@ class CursorHider:
     # 用户手一动就会产生远超 2 条的消息流。
     PHYSICAL_STREAK_N = 2
 
+    # 连续抢前台失败多少次就放弃本轮(见 __init__ 的刹车②)。
+    MAX_FG_STEAL_FAILS = 3
+
+    def _steal_disabled(self, hwnd) -> bool:
+        """本轮是否**放弃抢前台**(见 __init__ 的两个刹车)。
+
+        返回 True 时调用方必须直接返回: 不抢前台、不重夺捕获、不压光标
+        可见性 —— 因为这三件事都以"拿到前台"为前提, 抢不到时继续做只会
+        变成每 100ms 一次的无效抖动。
+        """
+        if getattr(self, "_give_up_steal", False):
+            return True
+        fg = user32.GetForegroundWindow()
+        if not fg or fg == hwnd:
+            return False
+        if self._is_foreign_fullscreen(fg):
+            self._fg_steal_skipped = getattr(self, "_fg_steal_skipped", 0) + 1
+            if not getattr(self, "_fullscreen_skip_logged", False):
+                self._fullscreen_skip_logged = True
+                print("[cursor] 前台是别的进程的**全屏窗口** -> 不抢焦点"
+                      "(抢了会让全屏程序/远程桌面黑屏)。\n"
+                      "         本轮穿越的光标可能保持可见, 键鼠仍归副机;"
+                      "按 Ctrl+Alt+Esc 可随时收回控制权。", flush=True)
+            return True
+        return False
+
+    def _is_foreign_fullscreen(self, hwnd) -> bool:
+        """该窗口是否**别的进程**的、覆盖整个虚拟桌面的窗口(全屏)。
+
+        ★ 必须排除外壳/桌面窗口: 用户点击空桌面时 `GetForegroundWindow()`
+          返回的是 explorer 的 Progman/WorkerW, 它**同样覆盖全屏** ——
+          若一并当成"全屏程序"而放弃抢前台, 就会退化成本项目早先反复
+          踩过的"光标在空桌面上隐藏不掉"(见 _cursor_guard_visible 的说明)。
+        """
+        try:
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value == kernel32.GetCurrentProcessId():
+                return False
+            if self._window_class(hwnd) in _SHELL_CLASSES:
+                return False
+            r = RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+                return False
+            from .input import virtual_desktop
+            d = virtual_desktop()
+            return rect_covers((r.left, r.top, r.right, r.bottom),
+                               (d.left, d.top, d.right, d.bottom))
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _window_class(hwnd) -> str:
+        try:
+            user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR,
+                                             ctypes.c_int]
+            user32.GetClassNameW.restype = ctypes.c_int
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, buf, 256)
+            return buf.value
+        except Exception:  # noqa: BLE001
+            return ""
+
     # hide() 之后的"落定静默期"(秒): 此期间收到的移动消息一律不计入物理
     # 移动。用于吸收 hide() 自身抖动注入的延迟回声(见 _proc 的说明)。
     HIDE_SETTLE_S = 0.4
@@ -454,6 +585,10 @@ class CursorHider:
 
     def _do_hide(self) -> None:
         from .input import get_cursor_pos
+        # 新一轮穿越: 刹车复位(上一轮放弃过不代表这一轮也抢不到)
+        self._give_up_steal = False
+        self._fg_fail_streak = 0
+        self._fullscreen_skip_logged = False
         # ★★★ 生产组合(低级钩子吞掉物理输入)下的关键差异:
         #   ShowCursor 的按线程计数器只有在该线程**处理鼠标输入**时才被
         #   提交到屏幕。钩子把物理事件全部吞掉后, 没有任何鼠标消息流动,
@@ -527,6 +662,22 @@ class CursorHider:
         #   这样也不用再依赖"抖动注入来提交计数器"那条脆弱链路 ——
         #   前台窗口的光标状态会被内核直接提交。
         self._stolen_foreground = user32.GetForegroundWindow()
+        # ★★ 抢前台的刹车(见 __init__): 前台若是**别的进程的全屏窗口**,
+        #   这里就不抢。代价是这一轮光标隐藏不了(SetCapture 需要前台),
+        #   但换来"不会把全屏程序/远程桌面打断成黑屏" —— 后者是灾难性的,
+        #   前者只是体验降级, 而且 Ctrl+Alt+Esc 随时能收回控制权。
+        if self._steal_disabled(self._hwnd):
+            # 拿不到前台 -> SetCapture 必然失败(MSDN: 只有前台窗口能捕获),
+            # 所以这里连试都不试, 也不去压光标可见性: 本轮以"光标可见"运行,
+            # 只保证 hider 窗口存在且已置顶, 其余交给上层。
+            self._captured = False
+            self._counter_after_hide = _set_cursor_visibility(True)
+            self._is_foreground = False
+            self._activated = False
+            self._hide_mono = time.monotonic()
+            self._physical_streak = 0
+            self._shown = True
+            return
         user32.EnableWindow(self._hwnd, TRUE)
         user32.SetActiveWindow(self._hwnd)
         # 用 AttachThreadInput 强制抢前台(照搬 MSWindowsDesks.cpp :617-622)

@@ -150,9 +150,14 @@ class TestServerOwnershipWiring:
         assert "_release_control()" in src, "回程信号必须交还控制权"
 
         # 心跳丢失看门狗(取代旧的时间兜底)
+        # ★ 2026-10-21: 交还动作收敛到唯一出口 `_force_release`(它额外设
+        #   "禁止重入"冷静期 —— 缺它会导致每秒一次的抢控制权抖动, 见
+        #   Server.ENTRY_LOCKOUT_S 的日志实证)。这里校验调用链不断。
         src2 = inspect.getsource(Server._start_peer_watchdog)
-        assert "_release_control()" in src2, \
+        assert "_force_release(" in src2, \
             "看门狗判定副电脑失联时必须交还控制权"
+        assert "_release_control()" in inspect.getsource(Server._force_release), \
+            "统一出口内必须真正交还控制权"
 
         # stop()
         src3 = inspect.getsource(Server.stop)

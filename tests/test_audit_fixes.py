@@ -68,10 +68,21 @@ class TestSessionGuard:
         assert "_start_session_guard()" in src
 
     def test_guard_releases_on_desktop_change(self):
-        """桌面名变化必须触发 edge.reset + _release_control。"""
+        """桌面名变化必须交还控制权(经统一出口 `_force_release`)。
+
+        ★ 2026-10-21 调整: 交还动作从"就地 edge.reset()+_release_control()"
+          收敛成**唯一出口** `Server._force_release` —— 它多做一件关键的
+          事: 设"禁止重入"冷静期。日志实证了缺它的后果:
+              03:27:46.427 光标越界 / 03:27:46.994 强制交回
+              03:27:47.097 光标越界 / 03:27:47.997 强制交回
+          交回后 100ms 又被同一个边缘动作抓回去 -> 每秒一次的抢控制权
+          抖动。所以断言改为: 守卫必须走统一出口, 且出口内必须交还控制权。
+        """
         src = inspect.getsource(server_mod.Server._start_session_guard)
-        assert "_release_control()" in src
-        assert "edge.reset()" in src
+        assert "_force_release(" in src
+        exit_src = inspect.getsource(server_mod.Server._force_release)
+        assert "_release_control()" in exit_src
+        assert "edge.reset()" in exit_src
 
     def test_guard_only_checks_while_outside(self):
         """非穿越态零开销: is_outside 为假时跳过查询。"""

@@ -154,6 +154,87 @@ def decide_key_eat(relay: bool, vk: int, extra_info: int) -> bool:
     return True
 
 
+# --- 强制收回控制权(逃生通道) --------------------------------------------
+#
+# ★★★ 为什么必须有它(2026-10-21 事故复盘):
+#   穿越期间本机**几乎没有任何输入通道**:
+#     * 键盘: 低级钩子把除 Caps/Num/Scroll 外的所有键都吞掉
+#       (含 Win / Alt+Tab / Ctrl+Shift+Esc —— 连任务管理器都叫不出来)
+#     * 鼠标: hider 窗口用 SetCapture 捕获, 点击不落到任何应用(含托盘)
+#     * 光标: 隐藏
+#   于是"退出穿越"只剩一个依据: **副机发回来的回程信号**。
+#   一旦触发条件出错(例如在远程桌面/全屏应用里推到了屏幕边),
+#   而副机又活着(心跳正常 -> 失联看门狗不触发), 用户就**没有任何
+#   自救手段**, 只能按 Ctrl+Alt+Del(SAS 不经过任何用户态钩子)。
+#   这是设计缺陷, 不是使用问题。这里补一条**只依赖键盘钩子**的
+#   逃生键: Ctrl+Alt+Esc。
+#
+# ★ 为什么放在钩子里判定, 而不是 RegisterHotKey:
+#   钩子回调本来就逐个看到**所有**物理键(relay 期间也不例外);
+#   而 RegisterHotKey 要求修饰键在系统输入状态下"真的按下" ——
+#   relay 期间 Ctrl/Alt 本身也被我们吞掉了, 系统状态里没有它们,
+#   热键反而不会触发。两害相权: 在钩子里自己记修饰键状态最可靠。
+VK_ESCAPE = 0x1B
+VK_CONTROL = 0x11       # 通用 Ctrl
+VK_MENU = 0x12          # 通用 Alt
+VK_LCONTROL = 0xA2
+VK_RCONTROL = 0xA3
+VK_LMENU = 0xA4
+VK_RMENU = 0xA5
+
+_CTRL_VKS = frozenset({VK_CONTROL, VK_LCONTROL, VK_RCONTROL})
+_ALT_VKS = frozenset({VK_MENU, VK_LMENU, VK_RMENU})
+
+
+class PanicCombo:
+    """Ctrl+Alt+Esc 判定器(纯状态机, 无 Windows 依赖, 可单测)。
+
+    ★ 左右 Ctrl/Alt 分开累计: 用户按"左 Ctrl + 右 Alt"也要认。
+    ★ 一次按住只触发一次(_latched), 松开触发键后复位 —— 避免用户
+      按住不放时每秒刷出几十次强制收回。
+    """
+
+    def __init__(self, vk: int = VK_ESCAPE):
+        self.vk = int(vk)
+        self._ctrl = set()
+        self._alt = set()
+        self._latched = False
+
+    @property
+    def ctrl_down(self) -> bool:
+        return bool(self._ctrl)
+
+    @property
+    def alt_down(self) -> bool:
+        return bool(self._alt)
+
+    def feed(self, vk: int, down: bool) -> bool:
+        """喂入一个键事件; 返回 True 表示"此刻刚按下组合键"。"""
+        vk = int(vk)
+        if vk in _CTRL_VKS:
+            (self._ctrl.add if down else self._ctrl.discard)(vk)
+            return False
+        if vk in _ALT_VKS:
+            (self._alt.add if down else self._alt.discard)(vk)
+            return False
+        if vk != self.vk:
+            return False
+        if not down:
+            self._latched = False
+            return False
+        if not (self._ctrl and self._alt):
+            return False
+        if self._latched:
+            return False
+        self._latched = True
+        return True
+
+    def reset(self) -> None:
+        self._ctrl.clear()
+        self._alt.clear()
+        self._latched = False
+
+
 # --- 钩子 -----------------------------------------------------------------
 
 class LowLevelHook:
@@ -170,8 +251,13 @@ class LowLevelHook:
     """
 
     def __init__(self, name: str = "ComBridgeHook",
-                 on_key_event=None):
+                 on_key_event=None, on_panic=None):
         self._name = name
+        # ★ 逃生通道回调: 用户按下 Ctrl+Alt+Esc 时由转发线程调用(不在钩子
+        #   回调里做, 那里的唯一职责是"尽快返回")。上层据此强制收回控制权。
+        self._on_panic = on_panic
+        self._panic_combo = PanicCombo()
+        self._panic_pending = False
         # ★ 键盘事件回调(照搬 Deskflow keyboardHookHandler 的
         #   PostThreadMessage 范式): 被 LL 钩子吞掉的键盘事件**不会**产生
         #   RawInput(实测 tools/diag_hook_kbd_rawinput.py: 钩子吞键后
@@ -235,6 +321,8 @@ class LowLevelHook:
             #   把调用次数单独记下来, 才能把这两种情况区分开。
             "kbd_calls": 0,
             "last_call": 0.0,
+            # ★ 逃生键(Ctrl+Alt+Esc)触发次数
+            "panic_hits": 0,
             # 系统静默摘钩后的自愈次数(见 request_reinstall)
             # 钩子线程心跳(每轮消息循环打点): 判定"线程还在泵消息"的
             # 唯一可观测手段 —— 用户日志三连事实(kbd_calls=0 + 泄漏触发
@@ -276,6 +364,17 @@ class LowLevelHook:
                 # 等到有活或被要求退出(超时兜底, 避免 set 丢失时永久挂住)
                 self._key_wake.wait(0.5)
                 self._key_wake.clear()
+                # ★ 逃生键优先于普通转发: 用户已经喊停了, 别再往副机送键
+                if self._panic_pending:
+                    self._panic_pending = False
+                    try:
+                        self._on_panic()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        self._key_queue.clear()   # 丢弃积压的按键
+                    except Exception:  # noqa: BLE001
+                        pass
                 while True:
                     try:
                         item = self._key_queue.popleft()
@@ -491,6 +590,19 @@ class LowLevelHook:
             info = ctypes.cast(addr, P(KBDLLHOOKSTRUCT)).contents
             extra = info.dwExtraInfo or 0
             self.stats["last_call"] = time.monotonic()
+            # ★★ 逃生键判定: 必须在 TAG 过滤与 relay 判定**之前**,
+            #   而且要看到**每一个**键(含被吞掉的 Ctrl/Alt), 所以放在这里。
+            #   回调里只置标志 + 唤醒转发线程, 不做任何实际工作。
+            if self._on_panic is not None:
+                try:
+                    if self._panic_combo.feed(
+                            info.vkCode & 0xFF,
+                            wparam not in (0x0105, 0x0101)):
+                        self.stats["panic_hits"] += 1
+                        self._panic_pending = True
+                        self._key_wake.set()
+                except Exception:  # noqa: BLE001
+                    pass
             if extra == InputInjector.TAG:
                 self.stats["injected_passed"] += 1
                 return user32.CallNextHookEx(None, code, wparam, lparam)

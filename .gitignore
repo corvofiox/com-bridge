@@ -33,3 +33,6 @@ tools/deskflow_full/
 test_music.npy
 noise_*.wav
 
+
+# 诊断产物(截图等)
+tools/_paint_probe/

@@ -112,6 +112,21 @@ class Server:
     #   与用户是否停止活动完全无关。
     PEER_LOSS_S = 5.0
 
+    # ★★★ 强制交回控制权之后的"禁止再进入"窗口(秒)。
+    #   为什么需要它(2026-10-21 事故复盘, 日志实证):
+    #   看门狗每 1s 轮询, 只在"处于穿越态"时才动作。它调 edge.reset()
+    #   把穿越态清掉, 但只要用户的手还在往屏幕边外推, **下一次位移**
+    #   就会立刻重新触发穿越 —— 日志里就是这么写的:
+    #       03:27:46.427 光标越界
+    #       03:27:46.994 !! 92s 未收到副电脑心跳, 判定失联 -> 强制交回
+    #       03:27:47.097 光标越界            <- 100ms 后又进去了
+    #       03:27:47.997 !! 93s 未收到副电脑心跳 ...
+    #   结果不是"交回控制权", 而是每秒一次的**抢控制权抖动**:
+    #   每次都要 抢前台 + 全屏窗 + SetCapture + 隐藏光标 + 注入抖动,
+    #   再全部撤销。用户的键鼠一半时间被吞, 全屏程序被反复抢焦点。
+    #   修法: 强制交回后设一个冷静期, 期间**不许**进入穿越态。
+    ENTRY_LOCKOUT_S = 2.0
+
     # 反向心跳间隔(秒)。打洞期间需要维持 NAT 映射, 太长会让映射过期。
     HEARTBEAT_INTERVAL_S = 1.0
 
@@ -242,7 +257,16 @@ class Server:
             "peer_lost": 0,
             "rendered_frames": 0,
             "events_forwarded": 0,
+            # ★ 回程事件注入计数。此前只在 _on_return_event 里 `+= 1`,
+            #   从未初始化 —— 副机回送任意一个事件就抛 KeyError
+            #   (日志实证: 03:16:23/31/34 三次)。异常被上层吞掉, 所以
+            #   表现为"回程时偶发一次点击/按键失效", 极难发现。
+            "events_injected": 0,
+            # 钩子不可用时被丢弃的键盘事件(见 _keyboard_relay_ready)
+            "keys_dropped_no_hook": 0,
         }
+        # 穿越态禁止进入的截止时刻(见 ENTRY_LOCKOUT_S 的说明)
+        self._entry_blocked_until = 0.0
 
     # -- 启动 ----------------------------------------------------------
 
@@ -776,11 +800,8 @@ class Server:
                     continue
                 silent = time.monotonic() - self._last_peer_heartbeat
                 if silent > self.PEER_LOSS_S:
-                    print(f"[server] !! {silent:.0f}s 未收到副电脑心跳, "
-                          f"判定失联 -> 强制交回控制权", flush=True)
-                    edge.reset()
-                    self._pin_point = None
-                    self._release_control()
+                    self._force_release(
+                        f"!! {silent:.0f}s 未收到副电脑心跳, 判定失联")
 
         t = threading.Thread(target=_loop, daemon=True, name="PeerWatchdog")
         t.start()
@@ -811,11 +832,8 @@ class Server:
                 if name is None:
                     continue    # 查询失败: 不误判
                 if prev is not None and name != prev:
-                    print(f"[server] !! 输入桌面已切换 ({prev} -> {name}), "
-                          f"判定发生锁屏/安全桌面 -> 强制交回控制权", flush=True)
-                    edge.reset()
-                    self._pin_point = None
-                    self._release_control()
+                    self._force_release(
+                        f"!! 输入桌面已切换 ({prev} -> {name}), 判定发生锁屏/安全桌面")
                 prev = name
 
         t = threading.Thread(target=_loop, daemon=True, name="SessionGuard")
@@ -1464,6 +1482,13 @@ class Server:
 
         if ev.type == EV_MOUSE_MOVE_REL:
             dx, dy = ev.a, ev.b
+            # ★★ 刚被强制交回(失联/桌面切换/用户逃生键)的冷静期内
+            #   **不许**再进穿越态 —— 否则用户的手只要还贴着边往外推,
+            #   下一个位移就又把控制权抢走, 变成每秒一次的前台/捕获抖动
+            #   (日志实证见 ENTRY_LOCKOUT_S)。
+            if not self._edge.is_outside and self._entry_blocked():
+                self._edge.reset()
+                return
             pushing_out = self._is_outward(dx, dy)
 
             if not self._edge.is_outside:
@@ -1648,6 +1673,44 @@ class Server:
 
     # -- 控制权(穿越期间 "吞掉本机输入" 的开关) --------------------------
 
+    def _entry_blocked(self, now: float | None = None) -> bool:
+        """此刻是否处于"刚被强制交回"的冷静期(不许再进穿越态)。"""
+        t = time.monotonic() if now is None else now
+        return t < getattr(self, "_entry_blocked_until", 0.0)
+
+    def _force_release(self, reason: str) -> bool:
+        """强制交回控制权(看门狗/桌面切换/用户逃生键的**唯一**出口)。
+
+        与 `_release_control` 的区别: 这里还负责**清状态 + 设冷静期**,
+        避免"交回后立刻又被同一个边缘动作抓回去"(见 ENTRY_LOCKOUT_S)。
+
+        返回是否真的从穿越态退出(调用方据此决定是否打印)。
+        """
+        edge = self._edge
+        if edge is None:
+            return False
+        was_outside = bool(edge.is_outside)
+        edge.reset()
+        self._pin_point = None
+        self._release_control()
+        if was_outside:
+            # 只有真的从穿越态被拽回来才设冷静期: 常态下调用(误按逃生键)
+            # 不得产生副作用, 否则用户会莫名卡住下一次穿越。
+            self._entry_blocked_until = time.monotonic() + self.ENTRY_LOCKOUT_S
+            print(f"[server] {reason} -> 控制权已交回本机 "
+                  f"(接下来 {self.ENTRY_LOCKOUT_S:.0f}s 内忽略越界, "
+                  f"避免抢控制权抖动)", flush=True)
+        return was_outside
+
+    def _on_user_abort(self) -> None:
+        """用户按下 Ctrl+Alt+Esc: 无条件交还控制权(逃生通道)。
+
+        ★ 只在**穿越态**下生效: 常态按到它不产生任何副作用(不改冷静期),
+          否则用户平时按 Ctrl+Alt+Esc(部分编辑器/终端用)会莫名卡一下穿越。
+        """
+        if self._edge is not None and self._edge.is_outside:
+            self._force_release("用户按下 Ctrl+Alt+Esc")
+
     def _acquire_control(self) -> None:
         """夺取控制权: 吞掉本机物理输入 + 隐藏本机光标。
 
@@ -1739,6 +1802,8 @@ class Server:
             #   InputEvent 字段直接喂进 _on_input_event, 复用同一条
             #   转发链(穿越态门槛/计数都在那里)。
             on_key_event=self._on_hook_key_event,
+            # ★ 逃生通道: 穿越期间 Ctrl+Alt+Esc 强制作废(见 hook.PanicCombo)
+            on_panic=self._on_user_abort,
         )
         if self._hook.start():
             self._pin_fallback = False

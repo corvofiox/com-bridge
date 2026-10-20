@@ -70,7 +70,12 @@ def test_hider_reacquire_represses_cursor():
     """
     proc = inspect.getsource(cursor_mod.CursorHider._proc)
     i_timer = proc.index("WM_TIMER")
-    seg = proc[i_timer:i_timer + 2200]
+    # ★ 2026-10-21: 切片上界改用"下一个分支"锚定, 不再用固定长度 ——
+    #   定时器分支里新增了抢前台刹车(见 CursorHider._steal_disabled),
+    #   固定字符数会把断言窗口切短。语义不变: 该分支内必须同时有
+    #   "重夺捕获"与"重压光标可见性"。
+    i_next = proc.find("WM_CAPTURECHANGED", i_timer)
+    seg = proc[i_timer:i_next] if i_next > i_timer else proc[i_timer:]
     assert "_set_cursor_visibility" in seg, \
         "重夺后必须重新压光标可见性"
     assert "_cursor_guard_visible" in proc, \
