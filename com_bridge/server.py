@@ -124,9 +124,10 @@ class Server:
     # 只把"光标跟着物理鼠标明显移动"当作摘钩证据。
     HOOK_PROBE_TOLERANCE_PX = 2
 
-    # 键盘钩子泄漏(穿越态收到 RawInput 键盘事件)最多触发几次重装。
-    # 超过就只打印一次提示, 避免刷屏(重装本身由鼠标自检的限流保护)。
-    KBD_LEAK_REINSTALL_LIMIT = 3
+    # (已废弃 2026-10-20) KBD_LEAK_REINSTALL_LIMIT 连同"RawInput 键盘泄漏
+    #   检测"整体移除: 物理按键实测证明其判据错误(hider 持前台 + 键盘
+    #   RawInput 并存时, 钩子收不到键是系统正常行为, 不是钩子坏)。
+    #   根因修复 = 移除键盘 RawInput 注册(register_keyboard=False)。
 
     # 键盘钩子自愈参数: 重装后等这么久再验证回调是否可达(给系统时间把
     # 新钩子挂上链), 最多尝试这么多次。
@@ -201,9 +202,6 @@ class Server:
         self._last_probe: tuple[int, int] = (0, 0)
         # 钩子重装次数(自愈; 超过 HOOK_REINSTALL_LIMIT 才退化为钉住)
         self._hook_reinstalls = 0
-        # ★ 键盘钩子泄漏计数(穿越态收到 RawInput 键盘事件 = 键盘钩子没吞住)。
-        #   与鼠标自检分开计数: 两个钩子是独立句柄, 可以单独失效。
-        self._kbd_leaks = 0
         # ★ 键盘钩子自检结果: None=未测/无法判定, True=可达, False=不可达。
         #   False 时**禁止转发键盘**(否则键同时落两台, 用户实测症状:
         #   "在副机打字, 主机也同步输入")。
@@ -513,9 +511,23 @@ class Server:
         # ★ RawInput 走 _on_raw_input_event 而不是直接 _on_input_event:
         #   前者兼作**键盘钩子存活检测**(穿越态收到 RawInput 键盘事件 =
         #   钩子没吞住 = 键盘钩子已被系统摘除)。见该方法的长注释。
+        #
+        # ★★★ register_keyboard=False —— **这是键盘跨屏失效的根因修复**。
+        #   物理按键实测(用户亲手按, 三组对照):
+        #     不注册任何 RawInput   -> hider 隐藏光标后键盘**正常**(+26)
+        #     只注册鼠标 0x02       -> 隐藏光标后键盘**正常**(+24)
+        #     只注册键盘 0x06       -> 隐藏光标后键盘**全灭**(+0)
+        #   机制: 本进程窗口(hider)在前台 + 注册了键盘 RawInput 时,
+        #   本进程的 WH_KEYBOARD_LL 钩子收不到任何键盘事件。而穿越期间
+        #   hider 必须抢前台才能隐藏光标(SetCapture 依赖前台), 于是必然触发
+        #   -> 键不吞不转发 -> 两机同时响应 -> 自愈重装无效 -> 暂停键盘转发
+        #   (正是用户日志里那一串)。
+        #   Deskflow 从未踩坑, 因为它**全程不注册 RawInput**。
+        #   保留鼠标 RawInput: 越界判定/回声过滤/TAG 判据都依赖它, 且实测无害。
         self._listener = RawInputListener(
             on_event=self._on_raw_input_event,
-            accept_synthetic=self._accept_synthetic_input)
+            accept_synthetic=self._accept_synthetic_input,
+            register_keyboard=False)
         self._listener.start()
         if not self._listener.wait_ready():
             raise RuntimeError("原始输入监听启动失败")
@@ -1142,6 +1154,12 @@ class Server:
                     if peer is not None:
                         max_bytes = max(0, avail) * block
                         if len(peer) > max_bytes:
+                            # ★★★ carry 覆盖丢弃计数: 被覆盖的尾部是**真实
+                            #   音频样本**, 每次覆盖 = 一次波形断口(咔哒)。
+                            #   此前此路径无任何统计, 快照全部正常也照样响。
+                            self.stats["carry_dropped_frames"] = \
+                                self.stats.get("carry_dropped_frames", 0) + \
+                                (len(peer) - max_bytes) // block
                             self._render_carry = peer[max_bytes:]
                             peer = peer[:max_bytes]
                         elif getattr(self, "_render_carry", b""):
@@ -1158,6 +1176,12 @@ class Server:
                 # 已写入的 ~30ms 播完 —— 这段时间通常足够下一包到达。
                 # ★ 绝不写静音填充: 静音会顶占渲染缓冲、并在静音/数据交界
                 #   处造成波形断裂(实测正是"持续均匀小杂音"的主源)。
+                # ★★ 诊断: 统计"渲染循环取不到数据"的次数与累计时长。
+                #   这是**周期性噼啪声最直接的证据** —— 每次取不到数据都
+                #   可能让渲染缓冲见底 -> 设备时钟停摆 -> 波形断裂。
+                #   之前没有这个计数, 导致只能靠推理猜根因(历史教训)。
+                self._render_empty_loops = \
+                    getattr(self, "_render_empty_loops", 0) + 1
                 if empty_since is None:
                     empty_since = time.monotonic()
                 elif time.monotonic() - empty_since > 0.2:
@@ -1177,6 +1201,46 @@ class Server:
             written = self._ren.write(peer)
             self.stats["rendered_frames"] += written
             time.sleep(0.002)
+
+            # ★★★ 周期性诊断快照(每 5 秒一行) —— 排障必须靠数据, 不能猜。
+            #   关注: peer 水位(应 >= jitter_ms)、渲染缓冲水位(应接近
+            #   render_target)、render_empty_loops(取不到数据的次数)、
+            #   underruns(队列空)、level_trims(水位削波)、ratio。
+            #   典型故障特征:
+            #     peer 水位远低于目标 + render_empty_loops 持续增长
+            #         -> 供给/消费失配, 队列被抽干, 渲染缓冲周期性见底
+            _now = time.monotonic()
+            _last_snap = getattr(self, "_last_audio_snapshot", 0.0)
+            if _now - _last_snap >= 5.0:
+                self._last_audio_snapshot = _now
+                _pb = peer_buf
+                print(
+                    f"[server] 音频: peer水位="
+                    f"{_pb.buffered_ms() if _pb else 0:.0f}ms/"
+                    f"{self.jitter_ms:.0f}ms "
+                    f"渲染缓冲={(self._ren.buffer_frames - avail) / self._ren.rate * 1000:.0f}ms"
+                    f"/{render_target / self._ren.rate * 1000:.0f}ms "
+                    f"空转={getattr(self, '_render_empty_loops', 0)} "
+                    f"欠载={_pb.underruns if _pb else 0} "
+                    f"预算饿={getattr(_pb, 'starved_budget', 0) if _pb else 0} "
+                    f"削波={self.stats.get('level_trims', 0)} "
+                    f"静音帧={self.stats.get('silence_frames', 0)} "
+                    f"重同步={self.stats.get('resync_popped', 0)} "
+                    f"carry丢帧={self.stats.get('carry_dropped_frames', 0)} "
+                    f"ratio={ratio:.5f} 到达率={arrival:.0f}",
+                    flush=True,
+                )
+                # ★★★ 第二行: **真丢包/时序**统计 —— 本地闭环永远测不出
+                #   网络丢包(UDP 无重传, 每丢 1 个 2.5ms 的包 = 1 个咔哒,
+                #   周期性丢失 = 周期性噼啪), 必须在真机上看。
+                _rx = getattr(self, "_audio_rx", None)
+                if _rx is not None:
+                    print(
+                        f"[server] 丢包: 累计丢={_rx.lost} 重复={_rx.dupes} "
+                        f"重启={_rx.resyncs} "
+                        f"carry滞留={len(getattr(self, '_render_carry', b'') or b'') // block}",
+                        flush=True,
+                    )
         self._ren.stop()
 
     # -- 输入 ----------------------------------------------------------
@@ -1262,8 +1326,6 @@ class Server:
                     #   键盘再也无人吞 = BUG1 复现)。真正的"根本装不上"会在
                     #   单轮内就连续触发超限。
                     self._hook_reinstalls = 0
-                    # 键盘泄漏计数同样每轮重置(偶发摘钩不该跨轮累积成刷屏)
-                    self._kbd_leaks = 0
                     self._send_place_event(x, y)
                     # 修饰键快照(照搬 Deskflow enter 的 toggleMask):
                     # 用户按住 Shift/Ctrl 时穿越, 副机需要知道
@@ -1360,27 +1422,35 @@ class Server:
     def _keyboard_relay_ready(self) -> bool:
         """键盘转发是否安全(钩子能吞键)。
 
-        ★★ 这是**动态**判据, 不是一次性结论 —— 钩子可用性会随焦点变化:
-          实测(tools/exp_window_vs_hook_precise.py):
-            本进程窗口是前台 -> kbd_calls 恒 0(回调不被调用)
-            焦点转移给别的窗口 -> 立刻恢复
-          而 GUI 启动时窗口**本来就有焦点**, 自检必然失败; 之后我们
-          主动放弃焦点, 钩子才恢复。所以:
-            - 不能在启动自检失败后**永久**禁用键盘(那是上一版的回归:
-              用户报"键盘跨屏完全失效")
-            - 必须允许恢复: 每次穿越开始时(以及周期性)重新复检
+        ★★★ 2026-10-19 物理按键实测后的**重要修正**: 穿越期间不能再用
+          probe 否定键盘转发。原因:
+            probe 靠 SendInput 注入探针键; 而**穿越期间 hider 必然占着
+            前台**(隐藏光标的必要条件, SetCapture 依赖前台)。前台是本进程
+            窗口时, 注入的键不一定能反映物理键的真实流向 —— 更重要的是,
+            只要 hider 持前台, 我们**本来就不该**把"probe 失败"当成
+            "键盘会泄漏"的证据:
+              * 若钩子真的收不到键 -> 键不会被吞, 但也**不会被转发**
+                (钩子是键盘事件的唯一来源), 所以**不会**出现"两台同时响应";
+              * 若钩子收得到键 -> 正常吞+转发。
+            两种情况都不会造成泄漏, 所以在穿越态因 probe 失败而丢弃键盘
+            只会白白把键盘功能关掉(用户报的"键盘跨屏完全失效")。
 
         ★ 判据:
           1. 钩子未装 / relay 未开 -> False
-          2. 自检结论过期(超过 KBD_VERIFY_TTL_S) -> 触发一次复检
-          3. 自检明确失败 -> False(丢弃键盘, 避免两台同时生效)
-          4. 自检通过/未知 -> True
+          2. **不在穿越态**(hider 未隐藏光标): probe 结论才可信, 过期则复检,
+             明确失败 -> False(此时是本进程别的窗口抢了前台, 真的会泄漏)
+          3. **在穿越态**: 不看 probe, 只要钩子已装 + relay 已开 -> True。
+             钩子若真收不到键, 事件根本不会到这里, 不会泄漏。
         """
         h = self._hook
         if h is None:
             return False
         if not (h.installed and h.relay):
             return False
+        # ★ 穿越态(hider 持前台): probe 不可信, 也不需要用 —— 见上面的说明
+        hider = getattr(self, "_hider", None)
+        if hider is not None and getattr(hider, "hidden", False):
+            return True
         # ★ 复检: 结论会过期(焦点可能已变化)
         now = time.monotonic()
         if (self._kbd_hook_verified is None
@@ -1592,37 +1662,32 @@ class Server:
             print(f"[server] 钩子键盘事件处理失败: {exc}", flush=True)
 
     def _on_raw_input_event(self, ev: InputEvent) -> None:
-        """RawInput 事件入口 —— 兼作**键盘钩子失效检测 + 自愈**。
+        """RawInput 事件入口(现在**只有鼠标**走这里)。
 
-        ★★ 为什么必须单独检测键盘钩子:
-          `WH_KEYBOARD_LL` 与 `WH_MOUSE_LL` 是**两个独立句柄**, 系统可以
-          只摘掉其中一个。键盘钩子的回调明显更重(要入队/唤醒), 钩子线程
-          一忙它就**先死**(约 300ms 超时被静默摘除), 鼠标钩子因回调极轻
-          而幸存 —— 症状恰好是"鼠标能跨屏, 但键盘两台同时生效"。
+        ★★★ 历史注记(2026-10-19, 已被物理按键实测推翻, 不要恢复):
+          这里原本还有一段"键盘钩子失效检测": 判据是"relay=True 时若
+          RawInput 仍报来键盘事件, 说明钩子没吞住"。它还配了一套
+          `_start_kbd_heal()` 重装自愈。
 
-        ★ 判据(基于本项目实测事实, 见 tools/exp_kbd_eaten_rawinput.py):
-          被键盘钩子吞掉的按键**不产生 RawInput**(与鼠标不对称)。因此
-          在 relay=True 时若 RawInput **仍然**报来键盘事件, 那只能是
-          "钩子没吞住" = 键盘钩子已被系统摘除。
-          (自己注入的键带 TAG, 已被 RawInputListener 过滤, 不会误判。)
-          此判据只覆盖"被系统摘除"这一情形 —— 若是别的程序抢先吞掉了键,
-          键到不了本机任何一层, 这里看不到泄漏, 必须靠 kbd_calls 判断
-          (GUI 状态行有显示)。
+          但这套机制的**前提是错的**, 而且它本身就是故障放大器:
+            1. 我们注册键盘 RawInput(RIDEV_INPUTSINK) 之后, 只要 hider
+               抢前台隐藏光标, 本进程的 WH_KEYBOARD_LL **就再也收不到
+               任何键**(物理键实测 kbd_calls +0, 而 RawInput +36) ——
+               也就是说"RawInput 有键、钩子没键"根本不代表钩子坏了,
+               它只是这个组合的**正常表现**。
+            2. 于是检测疯狂触发重装, 而重装改变不了前台归属 -> 必然无效
+               (用户日志里"自愈第 1/2/3 次未生效"+"暂停键盘转发"就是它)。
+            3. 更糟: 它把键盘转发**自己停掉**了, 而当时唯一的问题只是
+               我们多注册了一条不该注册的键盘 RawInput。
 
-        ⚠ 必须排除 **PASSTHROUGH_VKS**(Caps/Num/Scroll): 这三个键在 relay
-          模式下是**故意放行**的(保持本机指示灯同步), 它们本来就会产生
-          RawInput —— 不排除的话每次按 CapsLock 都会误判成"钩子已掉"。
+          修复方式不是改判据, 而是**不再注册键盘 RawInput**
+          (见 RawInputListener.register_keyboard)。症状(键不吞/不转发)
+          的根因随之消失, 这段检测自然也不需要了。
+
+        ⚠ 若将来要恢复某种"钩子存活检测", 判据必须是**钩子自己的回调计数**
+          是否推进(见 gui 状态行 / probe_keyboard_hook), 绝不能用
+          "RawInput 是否收到键盘"来推断。
         """
-        try:
-            if (ev.is_key and self._hook is not None
-                    and self._hook.relay
-                    and ev.code not in PASSTHROUGH_VKS):
-                self._kbd_leaks += 1
-                # ★ 泄漏检测: 与 Deskflow 一致的做法 —— 检出失效就重装
-                #   一次。交给后台线程, 绝不阻塞输入转发路径。
-                self._start_kbd_heal()
-        except Exception:  # noqa: BLE001
-            pass    # 检测失败绝不能影响正常转发
         self._on_input_event(ev)
 
     def _start_kbd_heal(self) -> None:
@@ -1654,7 +1719,6 @@ class Server:
                     self._kbd_hook_verified = True
                     print(f"[server] 键盘钩子自愈成功(第 {attempt} 次重装后"
                           f"回调可达) -> 恢复键盘转发", flush=True)
-                    self._kbd_leaks = 0
                     return
                 if probe is None:
                     # 注入失败 -> 判据不可用, 不要据此报"失败"

@@ -69,6 +69,9 @@ class WNDCLASSW(ctypes.Structure):
 # --- 常量 ---------------------------------------------------------------
 WM_INPUT = 0x00FF
 RIDEV_INPUTSINK = 0x00000100
+# ★★★ 注销某条 RawInput 注册: usUsage + RIDEV_REMOVE。见 RawInputListener
+#   的 keyboard 说明 —— 这是我们用来"解掉键盘 RawInput 与低级钩子冲突"的手段。
+RIDEV_REMOVE = 0x00000001
 RID_INPUT = 0x10000003
 RIM_TYPEMOUSE = 0
 RIM_TYPEKEYBOARD = 1
@@ -741,7 +744,8 @@ def get_cursor_pos() -> tuple[int, int]:
 class RawInputListener(threading.Thread):
     """后台线程, 消息循环接收 WM_INPUT, 把鼠标/键盘事件转成 InputEvent。"""
 
-    def __init__(self, on_event, accept_synthetic: bool = False):
+    def __init__(self, on_event, accept_synthetic: bool = False,
+                 register_keyboard: bool = True):
         super().__init__(daemon=True, name="RawInputListener")
         self._on_event = on_event
         self._hwnd = None
@@ -749,6 +753,26 @@ class RawInputListener(threading.Thread):
         self._rid = RAWINPUTDEVICE()
         self._running = False
         self._proc_ref = WNDPROC(self._wnd_proc)   # 常驻, 防 GC
+        # ★★★ register_keyboard=False: **不注册键盘 RawInput**。
+        #
+        #   为什么必须能关掉(2026-10-19 物理按键实测, 用户亲手按):
+        #   当本进程的窗口(光标隐藏器 CursorHider)抢占前台时, 若同时又注册了
+        #   键盘 RawInput(RIDEV_INPUTSINK, usUsage=0x06), 那么本进程的低级
+        #   键盘钩子(WH_KEYBOARD_LL)**收不到任何键盘事件** —— 物理键也不行。
+        #   三组对照(每步都由用户按真实按键, 用 kbd_calls 计数):
+        #      不注册任何 RawInput       正常 +20 / 隐藏光标后 **+26 正常**
+        #      只注册鼠标 0x02           正常 +22 / 隐藏光标后 **+24 正常**
+        #      只注册键盘 0x06           正常 +116 / 隐藏光标后 **+0 全灭**
+        #   => 冲突只来自**键盘** RawInput; 鼠标 RawInput 完全无害。
+        #
+        #   这正是 Deskflow 从未踩到这个坑的原因(见 tools/deskflow_full):
+        #   它也抢前台(MSWindowsDesks.cpp deskLeave 的 primary 分支),
+        #   钩子装法与我们完全相同(SetWindowsHookEx(WH_KEYBOARD_LL, ...)),
+        #   但它**全程不注册 RawInput**, 键盘靠低级钩子 + GetKeyboardState。
+        #
+        #   所以: 鼠标 RawInput 保留(越界判定/回声过滤/TAG 判据都靠它),
+        #   键盘事件改由低级钩子提供(钩子本来就在做这件事, 且隐藏光标时正常)。
+        self.register_keyboard = bool(register_keyboard)
         # ★★ 测试后门(默认 False): SendInput 注入的事件 hDevice==NULL,
         #   生产必须过滤(防别的程序注入/防回声); 但**活体验收工具**要用
         #   注入模拟"物理输入"驱动 EdgeDetector —— 此前 4 轮全绿的验收
@@ -926,10 +950,24 @@ class RawInputListener(threading.Thread):
         if not user32.RegisterRawInputDevices(byref(self._rid), 1,
                                               ctypes.sizeof(RAWINPUTDEVICE)):
             raise OSError("RegisterRawInputDevices(mouse) 失败")
-        self._rid.usUsage = 0x06       # keyboard
-        if not user32.RegisterRawInputDevices(byref(self._rid), 1,
-                                              ctypes.sizeof(RAWINPUTDEVICE)):
-            raise OSError("RegisterRawInputDevices(keyboard) 失败")
+        if self.register_keyboard:
+            self._rid.usUsage = 0x06       # keyboard
+            if not user32.RegisterRawInputDevices(byref(self._rid), 1,
+                                                  ctypes.sizeof(RAWINPUTDEVICE)):
+                raise OSError("RegisterRawInputDevices(keyboard) 失败")
+        else:
+            # ★ 显式**注销**键盘 RawInput(不只是"不注册")。
+            #   为什么要 REMOVE: RIDEV_INPUTSINK 是**按 hwndTarget 持久**的,
+            #   若同进程更早的监听器注册过键盘(热重载/自环测试/重复启动),
+            #   单纯"这次不注册"并不会撤销那条旧注册 —— 冲突会继续存在。
+            #   显式 REMOVE 保证无论之前状态如何, 键盘都不再走 RawInput。
+            stale = RAWINPUTDEVICE()
+            stale.usUsagePage = 0x01
+            stale.usUsage = 0x06
+            stale.dwFlags = RIDEV_REMOVE
+            stale.hwndTarget = None
+            user32.RegisterRawInputDevices(byref(stale), 1,
+                                           ctypes.sizeof(RAWINPUTDEVICE))
         self._running = True
         self._ready.set()
 

@@ -75,6 +75,25 @@ class IAudioRenderClient(IUnknown):
 class LoopbackCapture:
     """本机整机音频 loopback 采集。"""
 
+    # ★★★ 采集缓冲深度(100ms) —— 修复"副机传回主机的音频有周期性噼啪声"。
+    #
+    #   根因(2026-10-19 分析 + 之前的历史注记共同指向):
+    #     旧实现 `ac.Initialize(..., hnsBufferDuration=0, ...)`。共享模式下
+    #     0 表示"用**引擎建议的最小缓冲**", 实测通常只有几 ms。
+    #     而采集循环是 Python: 每轮 read() 都要过 GIL、可能有调度延迟。
+    #     只要这个延迟超过浅缓冲, WASAPI 共享模式就会**丢最旧的数据**
+    #     (无重传、无标记) —— 主机侧 pop_aligned 看到时间戳跳变,
+    #     判定为"该跳过的滞后" -> 重复/跳过样本 -> **周期性噼啪声**。
+    #
+    #   为什么"周期性": 丢多少、丢在哪取决于当时的调度抖动, 所以断口
+    #   大小不定但规律出现 —— 与用户报的"周期性噼啪声"完全一致。
+    #
+    #   修法: 显式给一个**足够深**的缓冲(100ms, 与渲染端对称),
+    #   让 Python 的调度抖动(几十 ms)被缓冲吸收, 不再丢音频。
+    #   代价: 采集侧多 100ms 延迟 —— 但渲染端本来就有 95ms 缓冲 +
+    #   60ms 抖动缓冲, 端到端延迟只多一点点, 换来无杂音是划算的。
+    BUFFER_DURATION_HNS = 1_000_000  # 100ms
+
     def __init__(self) -> None:
         self._com_inited = False
         self._ac = None
@@ -87,6 +106,12 @@ class LoopbackCapture:
         self.bits = 0
         self.block_align = 0
         self.buffer_frames = 0
+        # ★ 诊断: 统计"read() 轮询到空"的次数(缓冲浅时的高频路径),
+        #   以及"一次 read 拿到的帧数"分布 —— 前者高说明缓冲被反复抽干。
+        self.empty_reads = 0
+        self.total_frames = 0
+        self.read_calls = 0
+        self.max_chunk_frames = 0
 
     def start(self) -> None:
         from pycaw.api.audioclient import IAudioClient
@@ -131,7 +156,7 @@ class LoopbackCapture:
         ac.Initialize(
             AUDCLNT_SHARED,
             AUDCLNT_STREAMFLAGS_LOOPBACK,
-            0, 0, mix, zero,
+            self.BUFFER_DURATION_HNS, 0, mix, zero,
         )
         self.buffer_frames = ac.GetBufferSize()
         out = ac.GetService(ctypes.byref(IID_IAudioCaptureClient))
@@ -161,6 +186,7 @@ class LoopbackCapture:
         if self._cap is None:
             return None
         deadline = time.monotonic() + timeout_s
+        self.read_calls += 1
         while True:
             try:
                 ptr, frames, flags, devpos, qpc = self._cap.GetBuffer()
@@ -168,12 +194,16 @@ class LoopbackCapture:
                 return None
             if frames == 0:
                 self._cap.ReleaseBuffer(0)
+                self.empty_reads += 1
                 if time.monotonic() >= deadline:
                     return None
                 time.sleep(0.003)
                 continue
             raw = ctypes.string_at(ptr, frames * self.block_align)
             self._cap.ReleaseBuffer(frames)
+            self.total_frames += frames
+            if frames > self.max_chunk_frames:
+                self.max_chunk_frames = frames
             return raw, flags, qpc
 
     def stop(self) -> None:
@@ -764,7 +794,15 @@ class AlignedStreamBuffer:
                 out_frames += n
                 self._buf.popleft()
             if not chunks:
-                self.underruns += 1
+                # ★★★ 区分"真欠载"与"假信号"(2026-10-20 实测定案):
+                #   budget=0/1(渲染缓冲满, 本轮不需要数据)时 input_budget=0,
+                #   队列**明明有数据**也会走到这里 —— 旧代码把这种情形也计入
+                #   underruns, 实测 20 秒虚报 1282 次, 严重污染排障视线。
+                #   真欠载 = 队列真空(已在函数入口单独计数)。
+                if input_budget <= 0:
+                    self.starved_budget = getattr(self, "starved_budget", 0) + 1
+                else:
+                    self.underruns += 1
                 return None
 
         # 合并成一帧

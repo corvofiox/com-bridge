@@ -102,6 +102,18 @@ class ClockSync:
         """
         rtt = (t4 - t1) - (t3 - t2)
         offset = ((t2 - t1) + (t3 - t4)) / 2.0
+        # ★★★ 记录 offset 的**跳变幅度**(诊断时钟阶跃 —— 周期性噼啪的头号
+        #   嫌疑之一): 时间戳由 local_to_remote(offset) 打出, offset 阶跃
+        #   会让相邻包的 ts 突然错位, 服务端 pop_aligned/水位都会跟着跳。
+        #   本地闭环测试时钟域相同, 永远复现不了, 必须在真双机上看此计数。
+        _prev = getattr(self, "last_offset_us", None)
+        if _prev is not None:
+            jump = abs(offset - _prev)
+            self.max_offset_jump_us = max(
+                getattr(self, "max_offset_jump_us", 0.0), jump)
+            if jump > 10_000:  # >10ms 的跳变一定会造成可听断口
+                self.offset_jumps = getattr(self, "offset_jumps", 0) + 1
+        self.last_offset_us = offset
         self.history.append((offset, rtt))
         if len(self.history) > 16:
             self.history.pop(0)

@@ -328,20 +328,56 @@ class TestBug1CallbackStaysCheap:
         assert "_unhook_handles()" in src, "重装前必须先摘, 否则拿到旧句柄"
 
     def test_keyboard_hook_death_is_detected_separately(self):
-        """★★ 键盘钩子会**单独**失效, 必须单独检测 + 自愈。
+        """★★ 2026-10-19/20 重写: 键盘钩子"失效检测"的正确形态。
 
-        `WH_KEYBOARD_LL` 是**链式**钩子: 别的程序排在我们前面并返回非零时,
-        我们的回调一次都不会被调用 —— 用户症状是"鼠标计数正常、键盘恒为 0,
-        且主机输入法被同步唤起"。判据(实测: 被键盘钩子吞掉的键不产生
-        RawInput): 穿越态下若 RawInput 仍报来键盘事件, 就是没吞住。
+        历史(已被物理按键实测推翻, 保留教训):
+          旧判据是"relay=True 时若 RawInput 仍报来键盘事件 = 钩子没吞住",
+          并据此重装钩子 + 暂停键盘转发。但真机实测证明:
+            **hider 持前台 + 注册键盘 RawInput(RIDEV_INPUTSINK)** 时,
+            本进程的 WH_KEYBOARD_LL **收不到任何键**(物理键 kbd_calls+0,
+            而 RawInput+36) —— "RawInput 有键、钩子无键"是该组合下的
+            **正常表现**, 不是钩子坏了。据此触发重装必然无效(重装改变
+            不了前台归属), 只会把正常的键盘转发误停(用户日志里
+            "自愈 3 次未生效 -> 暂停键盘转发"即此)。
+          根因修复: 不再注册键盘 RawInput(register_keyboard=False +
+          RIDEV_REMOVE), 键盘事件由低级钩子自产。原泄漏检测随之废弃。
+
+        新断言:
+          1. 键盘 RawInput 注册被移除(server 与 agent 都是);
+          2. 原"RawInput 键盘泄漏检测"代码路径不存在;
+          3. Deskflow 对照: 它从不注册 RawInput, 同样抢前台却无此问题。
         """
-        src = _strip_comments(inspect.getsource(Server._on_raw_input_event))
-        assert "is_key" in src
-        assert "relay" in src
-        assert "_start_kbd_heal()" in src
-        # RawInput 必须接到这个检测入口, 而不是直接接 _on_input_event
+        # 1) server/agent 都不再注册键盘 RawInput
         start_src = inspect.getsource(Server._start_input)
-        assert "_on_raw_input_event" in start_src
+        assert "register_keyboard=False" in start_src, \
+            "server 必须关闭键盘 RawInput 注册(物理按键实测的根因修复)"
+        agent_src = inspect.getsource(Agent._make_return_listener) \
+            if hasattr(Agent, "_make_return_listener") else None
+        if agent_src is None:
+            # 回传监听器的构造点在 agent 源码里, 直接全文检索
+            agent_src = (ROOT / "com_bridge" / "agent.py").read_text(
+                encoding="utf-8")
+        assert "register_keyboard=False" in agent_src, \
+            "agent 必须关闭键盘 RawInput 注册"
+        # 2) RawInputListener 支持 register_keyboard 开关 + 显式 REMOVE
+        assert "register_keyboard" in inspect.getsource(
+            input_mod.RawInputListener.__init__)
+        run_src = inspect.getsource(input_mod.RawInputListener.run)
+        assert "RIDEV_REMOVE" in run_src, \
+            "必须显式注销键盘 RawInput(热重载/残留注册场景)"
+        # 3) 原泄漏检测已废弃: _on_raw_input_event 不得再**调用**自愈
+        #    (docstring 里的历史注记允许保留, 用 AST 只看真实调用)
+        import ast as _ast
+        tree = _ast.parse(
+            (ROOT / "com_bridge" / "server.py").read_text(encoding="utf-8"))
+        fn = next(n for n in _ast.walk(tree)
+                  if isinstance(n, _ast.FunctionDef)
+                  and n.name == "_on_raw_input_event")
+        calls = [c.func.id for c in _ast.walk(fn)
+                 if isinstance(c, _ast.Call)
+                 and isinstance(c.func, _ast.Name)]
+        assert "_start_kbd_heal" not in calls, \
+            "RawInput 键盘泄漏检测已被实测证伪并移除, 不得恢复"
 
     def test_heal_loop_verifies_not_just_reinstalls(self):
         """自愈不能"重装完就算" —— 必须**验证**回调真的可达。
@@ -387,82 +423,34 @@ class TestBug1CallbackStaysCheap:
                 assert i_calls < src.index(later), \
                     f"kbd_calls 必须早于 {later}"
 
-    def test_leak_counter_exists_and_resets(self):
-        assert Server.KBD_LEAK_REINSTALL_LIMIT >= 1
-        assert "_kbd_leaks" in inspect.getsource(Server.__init__)
-        # 每轮穿越重置(偶发失效不该跨轮累积成刷屏)
-        assert "_kbd_leaks = 0" in _strip_comments(
-            inspect.getsource(Server._on_input_event))
+    def test_leak_detector_retired_after_rawinput_fix(self):
+        """★★ 2026-10-20: 原"RawInput 键盘泄漏检测"三件套已整体废弃。
 
-    def test_leak_detector_imports_passthrough(self):
-        """Caps/Num/Scroll 是**故意放行**的, 必须排除在泄漏判据之外。
-
-        否则每按一次 CapsLock 都会被误判成"键盘钩子已掉"而触发自愈。
-        这条同时锁住 `PASSTHROUGH_VKS` 的导入 —— 漏了导入会在运行时抛
-        NameError, 且被 except 吞掉, 现场完全看不出来。
+        物理按键实测(用户亲手按, RawInput 计数作证)证明其判据根本错误:
+        hider 持前台 + 键盘 RawInput 并存时, 钩子收不到任何键是**系统
+        正常行为**, 据此触发"重装+暂停键盘转发"是误诊(重装改变不了
+        前台归属, 只会把好端端的键盘转发停掉)。根因修复是移除键盘
+        RawInput 注册, 因此:
+          - 泄漏计数器(_kbd_leaks)与放行键排除(PASSTHROUGH_VKS)不再有
+            消费者, 相关断言一并退役;
+          - PASSTHROUGH_VKS 本身保留(钩子回调用它放行指示灯键),
+            只是 RawInput 泄漏判据不再引用它。
+        本测试锁死"不得恢复"这三件已证伪的机制。
         """
         import com_bridge.server as server_mod
-        assert hasattr(server_mod, "PASSTHROUGH_VKS")
-        src = _strip_comments(inspect.getsource(Server._on_raw_input_event))
-        assert "PASSTHROUGH_VKS" in src
-
-    def test_leak_detector_ignores_passthrough_keys(self):
-        """行为验证: 放行键不得触发自愈, 普通键必须触发。"""
-        from com_bridge.hook import PASSTHROUGH_VKS
-        from com_bridge.protocol import EV_KEY, KEY_DOWN, InputEvent
-
-        class FakeTx:
-            def send(self, ev):
-                pass
-
-        class FakeEdge:
-            is_outside = True
-            self_rect = None
-
-        class FakeHook:
-            relay = True
-            # ★ 键盘转发以"钩子能吞键"为前提(见 _keyboard_relay_ready)
-            installed = True
-
-            def __init__(self):
-                self.heals = 0
-
-            def request_reinstall(self):
-                self.heals += 1
-
-        def make():
-            s = Server.__new__(Server)
-            s._edge = FakeEdge()
-            s._input_tx = FakeTx()
-            s._hook = FakeHook()
-            s._kbd_hook_verified = True
-            s._kbd_verify_mono = 1e18    # TTL 内, 避免触发复检(桩无 probe)
-            s._kbd_leaks = 0
-            s._kbd_healing = False
-            s._kbd_heal_lock = __import__("threading").Lock()
-            s._stop = __import__("threading").Event()
-            s.stats = {"events_forwarded": 0}
-            # 用假的 _start_kbd_heal 记录调用(真实现会起线程)
-            s._heal_calls = 0
-
-            def fake_heal():
-                s._heal_calls += 1
-
-            s._start_kbd_heal = fake_heal
-            return s
-
-        # CapsLock(放行键): 不得触发自愈
-        s = make()
-        vk = sorted(PASSTHROUGH_VKS)[0]
-        s._on_raw_input_event(InputEvent(EV_KEY, KEY_DOWN, vk, 0x3A, 0, 0))
-        assert s._heal_calls == 0, "放行键被误判成键盘钩子失效"
-        assert s._kbd_leaks == 0
-
-        # 普通键: 必须触发自愈
-        s2 = make()
-        s2._on_raw_input_event(InputEvent(EV_KEY, KEY_DOWN, 0x41, 0x1E, 0, 0))
-        assert s2._heal_calls == 1, "键盘钩子泄漏未被检测到"
-        assert s2._kbd_leaks == 1
+        # 用 AST 判断"无真实调用"(docstring 里的历史注记允许保留)
+        import ast as _ast2
+        _srv_tree = _ast2.parse(
+            (ROOT / "com_bridge" / "server.py").read_text(encoding="utf-8"))
+        _fn = next(n for n in _ast2.walk(_srv_tree)
+                   if isinstance(n, _ast2.FunctionDef)
+                   and n.name == "_on_raw_input_event")
+        _calls = [c.func.id for c in _ast2.walk(_fn)
+                  if isinstance(c, _ast2.Call)
+                  and isinstance(c.func, _ast2.Name)]
+        assert "_start_kbd_heal" not in _calls
+        assert not hasattr(server_mod.Server, "KBD_LEAK_REINSTALL_LIMIT"), \
+            "泄漏重装上限常量已随机制废弃"
 
     def test_diag_exposes_hooks_separately(self):
         """诊断必须能区分"只有键盘钩子掉了"(否则现场无法自查)。"""

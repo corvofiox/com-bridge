@@ -348,7 +348,8 @@ class Agent:
         cap.start()          # 必须在本线程调用(COM 线程亲和)
         print(
             f"[agent] loopback 就绪: {cap.channels}ch @{cap.rate}Hz {cap.bits}bit "
-            f"buffer={cap.buffer_frames}帧",
+            f"buffer={cap.buffer_frames}帧"
+            f"({cap.buffer_frames * 1_000_000 // max(1, cap.rate)}ms)",
             flush=True,
         )
         clock = self._control.clock if self._control else None
@@ -357,8 +358,30 @@ class Agent:
             self._tone_loop(cap, clock)
             cap.stop()
             return
+        # ★★★ 静音补包必须按**实时速率**补足, 否则队列会被抽干。
+        #
+        #   实测根因(2026-10-20, tools/verify_audio_capture_path.py):
+        #     旧实现每次 read 超时只补**一个** 120 帧包(2.5ms),
+        #     而 read 每 30ms 超时一次 -> 供给速率 ≈ 2.5ms/30ms = 83ms/s,
+        #     而主机消费速率是 1000ms/s。缺口 12 倍!
+        #     实测水位: 0→2→4→6... 每 200ms 只涨 2ms, 29% 的时间
+        #     低于 20ms(目标 60ms), 欠载 1275 次/20s。
+        #     队列被抽干 -> 渲染缓冲见底 -> 波形断裂 = **周期性噼啪声**。
+        #
+        #   ★ 与 _tone_loop 同一个道理: 必须用 **catch-up 语义** ——
+        #     "自上次发包以来过了多少真实时间, 就补多少帧",
+        #     一次补齐。供给速率因此严格等于时钟速率, 与调度抖动无关。
+        #
+        #   注意: 有声音时不能补静音(会盖掉真实音频), 所以只在
+        #   连续读不到数据(silence_ticks >= 2)时进入补包分支;
+        #   但一旦进入, 就必须一次补齐这段时间的全部缺口。
+        SEND_FRAMES = 120
+        pkt_dur_us = int(SEND_FRAMES * 1_000_000 / cap.rate)
+        self._capture_t0 = time.monotonic()
+        # 补包用的"上次补到的时间点"(音频时钟域)
+        self._silence_last_ts = 0
         while not self._stop.is_set():
-            r = cap.read(timeout_s=0.2)
+            r = cap.read(timeout_s=0.03)
             if r is None:
                 # ★★★ 静音时 WASAPI **不返回任何包**(实测: read 全是 None)。
                 #   若此时什么都不发, 主机的音频时间轴就出现**空洞** ——
@@ -369,34 +392,50 @@ class Agent:
                 #
                 #   修法: 静音期间**主动补发全零包**, 保持时间轴连续。
                 #   只在"确实静音"时补(连续多次 read 超时), 且带正确的
-                #   QPC 时间戳, 让主机的队列看到连续的流。
+                #   时间戳, 让主机的队列看到连续的流。
                 self._silence_ticks = getattr(self, "_silence_ticks", 0) + 1
                 if self._silence_ticks >= 2:
-                    # 补一个静音包, 同样按 MTU 上限(120 帧, 不分片)
-                    n_frames = 120
-                    silent = b"\x00" * (n_frames * cap.block_align)
+                    # ★★★ catch-up: 算出"自上次补包以来过了多少真实时间",
+                    #   一次补足那么多帧(按 120 帧一片切分)。
+                    #   这样供给速率 == 消费速率, 队列不会掉。
+                    now_mono = time.monotonic()
+                    last_mono = getattr(self, "_silence_last_mono", None)
+                    if last_mono is None:
+                        last_mono = now_mono
+                    elapsed = now_mono - last_mono
+                    # 至少补 1 片, 但**不无限补**(极端卡顿时别一次性
+                    # 灌几百 ms, 那会造成主机侧队列突增 -> 削波爆音)
+                    need_frames = int(elapsed * cap.rate)
+                    max_frames = cap.rate // 4      # 上限 250ms
+                    if need_frames < SEND_FRAMES:
+                        need_frames = SEND_FRAMES
+                    if need_frames > max_frames:
+                        need_frames = max_frames
+                    self._silence_last_mono = now_mono
+
+                    silent = b"\x00" * (need_frames * cap.block_align)
                     # ★ 时间戳必须**接在上一包之后**(严格递增),
                     #   不能用 now_us() —— 那可能与上一包乱序, 而主机侧
                     #   pop_aligned 依赖时间戳单调, 乱序会被当成"滞后"。
-                    dur_us = int(n_frames * 1_000_000 / cap.rate)
                     last = getattr(self, "_last_audio_ts", 0)
-                    if last:
-                        ts = last + dur_us
-                    else:
-                        ts = now_us()
-                        if clock is not None and clock.synced:
-                            ts = clock.local_to_remote(ts)
-                    self._last_audio_ts = ts
-                    self._audio_tx.send(
-                        silent,
-                        rate=cap.rate,
-                        bits=cap.bits,
-                        channels=cap.channels,
-                        chan_mask=0x3,
-                        ts_us=ts,
-                    )
+                    base = last if last else now_us()
+                    sent_f = 0
+                    while sent_f < need_frames:
+                        n = min(SEND_FRAMES, need_frames - sent_f)
+                        piece_ts = base + int(sent_f * 1_000_000 / cap.rate)
+                        self._audio_tx.send(
+                            b"\x00" * (n * cap.block_align),
+                            rate=cap.rate,
+                            bits=cap.bits,
+                            channels=cap.channels,
+                            chan_mask=0x3,
+                            ts_us=piece_ts,
+                        )
+                        sent_f += n
+                    self._last_audio_ts = base + int(
+                        need_frames * 1_000_000 / cap.rate)
                     self.stats["silence_sent"] = \
-                        self.stats.get("silence_sent", 0) + 1
+                        self.stats.get("silence_sent", 0) + sent_f
                 continue
             self._silence_ticks = 0
             pcm, flags, qpc = r
@@ -429,6 +468,20 @@ class Agent:
                 ts = now_us()
                 if clock is not None and clock.synced:
                     ts = clock.local_to_remote(ts)
+            # ★★★ 时间戳必须**严格单调递增**。
+            #
+            #   场景: 静音期我们按 catch-up 推进了时间轴(_last_audio_ts),
+            #   恢复有声时 WASAPI 给的 qpc 可能落在我们已推进的位置**之前**
+            #   (设备时钟与本地时钟有微小偏移, 加上补包量的取整误差)。
+            #   一旦时间戳倒退, 主机侧 `pop_aligned` 会把它当成"乱序/滞后",
+            #   触发重复或跳过样本 -> **爆音**。
+            #   修法: 若 ts <= 上一个时间戳, 就从上一个继续推进。
+            _prev_ts = getattr(self, "_last_audio_ts", 0)
+            if _prev_ts and ts <= _prev_ts:
+                ts = _prev_ts + 1
+            # 静音->有声 切换时, 补包的"catch-up 基准"要重置,
+            # 否则下一次进入静音分支会从过时的时间点起算, 补出过量音频。
+            self._silence_last_mono = None
             # ★★★ 按 MTU 分包发送(2026-10-19 关键修正)。
             #
             #   根因: 一包 480 帧 x 2ch x 32bit = **3840 字节**,
@@ -473,6 +526,36 @@ class Agent:
             self.stats["packets_split"] = \
                 self.stats.get("packets_split", 0) + \
                 ((total_frames + SEND_FRAMES - 1) // SEND_FRAMES)
+
+            # ★★★ 周期性诊断(每 5 秒) —— 排障靠数据, 不靠猜。
+            #   关键量:
+            #     cap_buffer_ms  : WASAPI 采集缓冲深度(应 >= 20ms;
+            #                      太浅 -> Python 调度抖动就会丢音频)
+            #     empty_reads    : GetBuffer 拿不到数据的次数(高=缓冲被抽干)
+            #     avg_chunk_ms   : 每次 read 拿到的平均时长
+            #   典型故障: avg_chunk_ms 明显小于 cap_buffer_ms 且
+            #   empty_reads 很高 -> 采集端在丢帧 -> 主机听到周期性杂音。
+            _now = time.monotonic()
+            _last_snap = getattr(self, "_last_capture_snapshot", 0.0)
+            if _now - _last_snap >= 5.0:
+                self._last_capture_snapshot = _now
+                _elapsed = max(1e-6, _now - getattr(
+                    self, "_capture_t0", _now))
+                _sent = self.stats.get("frames_sent", 0)
+                _cap_ms = cap.buffer_frames * 1000.0 / max(1, cap.rate)
+                _avg_ms = (_sent / max(1, cap.rate) * 1000.0 / _elapsed)
+                _clk = f" offset跳变={clock.offset_jumps} 最大={clock.max_offset_jump_us / 1000:.1f}ms" if (
+                    clock is not None and getattr(clock, "offset_jumps", 0)) else ""
+                print(
+                    f"[agent] 采集: 缓冲={_cap_ms:.0f}ms "
+                    f"空读={cap.empty_reads} "
+                    f"读次数={cap.read_calls} "
+                    f"实供={_avg_ms:.0f}ms/s "
+                    f"需要={1000.0:.0f}ms/s "
+                    f"静包={self.stats.get('silence_sent', 0)}"
+                    f"{_clk}",
+                    flush=True,
+                )
         cap.stop()
 
     def _tone_loop(self, cap, clock) -> None:
@@ -1005,7 +1088,14 @@ class Agent:
         #   NAT/conntrack 不认(与主电脑转发输入是同一个道理)。
         if self._input_rx is not None:
             self._input_tx.use_socket(self._input_rx._sock, self._input_rx)
-        self._return_listener_obj = RawInputListener(on_event=self._on_return_event)
+        # ★★★ register_keyboard=False: 与 server 侧同一个根因修复。
+        #   副机也用 CursorHider 隐藏光标(hide_on_motion=True), 而
+        #   「hider 持前台 + 键盘 RawInput」会让本进程的低级键盘钩子收不到键。
+        #   副机的回程判定只需要**鼠标** RawInput, 键盘事件由主电脑转发注入,
+        #   不需要键盘 RawInput。
+        #   实测依据见 RawInputListener.register_keyboard 的长注释。
+        self._return_listener_obj = RawInputListener(
+            on_event=self._on_return_event, register_keyboard=False)
         self._return_listener_obj.start()
         if not self._return_listener_obj.wait_ready():
             print("[agent] 输入回传监听启动失败", flush=True)
