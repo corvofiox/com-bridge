@@ -146,11 +146,14 @@ def test_elev_toggle_is_async_and_silent():
 
     ★ 用户明确要求: "不能加入需要用户确认的过程, 整个过程必须静默"。
     """
-    src = inspect.getsource(gui_mod.ComBridgeGui._on_elev_toggle)
+    src = inspect.getsource(gui_mod.ComBridgeGui._on_autostart_switch)
     assert "Thread" in src
     assert "autostart" in src, "必须走静默的 autostart 模块"
     assert "request_elevated" not in src, "不得弹 UAC"
     assert "_elev_toggling = True" in src, "必须有防重入"
+    # 翻转入口必须真的转调过去(不能是空壳)
+    toggle_src = inspect.getsource(gui_mod.ComBridgeGui._on_elev_toggle)
+    assert "_on_autostart_switch" in toggle_src
 
 
 def test_task_exists_is_cached():
@@ -187,11 +190,17 @@ def test_gui_reads_real_state_after_toggle():
     这个 bug 真实发生过: 旧实现里父进程的 task_exists 缓存不会被子进程
     的 invalidate 清掉 -> 注册成功了界面仍显示"未启用" -> 用户以为失败。
     现在改为读注册表(无缓存层), 但**刷新动作仍必须发生**, 否则界面上
-    的按钮文字会停留在旧值。
+    的按钮/开关会停留在旧值。
+
+    ★ 2026-10-21: 实现位置从 `_on_elev_toggle` 移到 `_on_autostart_switch`
+      (浅色版把按钮换成了 Canvas 开关)。不变量不变: 操作完成后必须刷新。
     """
-    toggle_src = inspect.getsource(gui_mod.ComBridgeGui._on_elev_toggle)
-    assert "_refresh_elev_state" in toggle_src, \
+    impl_src = inspect.getsource(gui_mod.ComBridgeGui._on_autostart_switch)
+    assert "_refresh_elev_state" in impl_src, \
         "操作完成后必须刷新界面状态"
+    # 翻转入口也要能走到刷新(经转调)
+    toggle_src = inspect.getsource(gui_mod.ComBridgeGui._on_elev_toggle)
+    assert "_on_autostart_switch" in toggle_src
     refresh_src = inspect.getsource(
         gui_mod.ComBridgeGui._refresh_elev_state)
     assert "is_enabled" in refresh_src, "必须读取真实状态"
@@ -203,8 +212,8 @@ def test_autostart_messages_reach_file_log():
     实测: 用户报"注册不成功"时, 日志文件里一条 [自启] 记录都没有 ——
     因为这些消息只进了界面队列(_log_q), 进程结束就消失。
     """
-    toggle_src = inspect.getsource(gui_mod.ComBridgeGui._on_elev_toggle)
-    assert "gui_log" in toggle_src and "write_line" in toggle_src, \
+    impl_src = inspect.getsource(gui_mod.ComBridgeGui._on_autostart_switch)
+    assert "gui_log" in impl_src and "write_line" in impl_src, \
         "自启结果必须落盘"
 
 
@@ -256,9 +265,17 @@ def test_background_threads_use_post_ui():
     assert "_closing" in src, "退出中应直接放弃投递"
 
     # 自启查询/切换与托盘回调都必须走 _post_ui
-    for name in ("_refresh_elev_state", "_on_elev_toggle", "_init_tray"):
+    # ★ 2026-10-21: 自启的**实际实现**从 `_on_elev_toggle` 移到了
+    #   `_on_autostart_switch`(浅色版把按钮换成了 Canvas 开关,
+    #   开关是"目标态"语义, 需要显式 want_on)。`_on_elev_toggle` 保留为
+    #   翻转入口(托盘菜单/旧调用方)。不变量不变: 后台回调必须走 _post_ui。
+    for name in ("_refresh_elev_state", "_on_autostart_switch", "_init_tray"):
         fn_src = inspect.getsource(getattr(gui_mod.ComBridgeGui, name))
         assert "_post_ui" in fn_src, f"{name} 的后台回调必须走 _post_ui"
+    # 翻转入口必须转调新实现(不能是空壳)
+    toggle_src = inspect.getsource(gui_mod.ComBridgeGui._on_elev_toggle)
+    assert "_on_autostart_switch" in toggle_src, \
+        "_on_elev_toggle 必须转调 _on_autostart_switch"
 
 
 def test_log_backlog_preserved_when_window_closed():

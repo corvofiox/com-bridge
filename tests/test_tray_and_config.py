@@ -328,10 +328,15 @@ def test_log_window_bounded():
 
 
 def test_main_ui_has_window_entry_buttons():
-    """主界面必须有打开次级窗口的按钮。"""
+    """主界面必须有打开次级窗口的入口。
+
+    ★ 2026-10-21 经过一轮反复: 先是顶栏同时有状态+日志, 后按要求只留
+      状态(日志挪到托盘), 用户反馈"日志入口没了"——判定为严重问题。
+      现在**两个入口都在顶栏**, 托盘菜单那条也保留。
+    """
     src = inspect.getsource(gui_mod.ComBridgeGui._build)
-    assert "_open_status_window" in src
-    assert "_open_log_window" in src
+    assert "_open_status_window" in src, "状态入口应在主界面"
+    assert "_open_log_window" in src, "日志入口应在主界面(用户明确要求)"
 
 
 def test_main_ui_no_log_text_widget():

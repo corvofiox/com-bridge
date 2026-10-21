@@ -96,6 +96,20 @@ class _TeeStdout:
         return False
 
 
+def _fmt_num(v) -> str:
+    """把配置里的数字显示成"人读的样子"。
+
+    ★ 配置里 jitter_ms 存的是 float(60.0), 直接 str() 会让输入框显示
+      "60.0" —— 这在界面上非常扎眼(用户截图反馈过)。整数值一律去掉
+      小数部分, 只有真的是小数时才保留。
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return str(int(f)) if f == int(f) else str(v)
+
+
 class ComBridgeGui:
     def __init__(self, start_hidden: bool = False) -> None:
         # 必须先补好 stdout/stderr: 窗口化 exe 里它们是 None, 后面 tee 与
@@ -138,7 +152,22 @@ class ComBridgeGui:
         # 0 表示没有宽限, 监控按正常规则交还焦点。
         self._focus_grace_until = 0.0
 
+        # ★ 先定配色再建界面: 所有控件都在构建时从 ui_theme 的模块级
+        #   常量取色, 所以模式必须在 _build() 之前确定。
+        try:
+            from . import ui_theme as _T
+            _T.set_mode(self._resolve_mode())
+        except Exception:  # noqa: BLE001
+            pass
+
         self._build()
+        # ★ 应用图标(标题栏 + 任务栏)。内嵌 base64, 零路径依赖 ——
+        #   单文件 exe 解包后读文件会失效(见 tray.py 的历史注释)。
+        try:
+            from . import appicon
+            appicon.apply(self.root)
+        except Exception:  # noqa: BLE001
+            pass
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         # ★ 用户主动操作窗口时给焦点宽限期(见 _grant_focus_grace):
         #   否则监控会在 700ms 内把他的交互打断 —— 实测表现为
@@ -220,9 +249,13 @@ class ComBridgeGui:
             if cfg.get("server_host") and getattr(self, "_host_var", None):
                 self._host_var.set(str(cfg["server_host"]))
             if cfg.get("jitter_ms") and getattr(self, "_jitter_var", None):
-                self._jitter_var.set(str(cfg["jitter_ms"]))
+                # ★ 必须走 _fmt_num: 直接 str(60.0) 会让输入框显示 "60.0"
+                self._jitter_var.set(_fmt_num(cfg["jitter_ms"]))
             if cfg.get("side") and getattr(self, "_side_var", None):
                 self._side_var.set(str(cfg["side"]))
+                grp = getattr(self, "_side_group", None)
+                if grp is not None and str(cfg["side"]) in SIDES:
+                    grp.set_value(str(cfg["side"]))
         except Exception:  # noqa: BLE001
             pass
         self._log_q.put("[gui] 上次为运行状态 -> 自动重连…")
@@ -230,181 +263,401 @@ class ComBridgeGui:
 
     # -- 布局 ----------------------------------------------------------
 
-    def _build(self) -> None:
-        """主界面布局(现代化重设计, 2026-10-19)。
+    _ROLE_DESC = {
+        "server": "主电脑接键盘鼠标与音箱",
+        "agent": "静音本机，把声音送到主电脑",
+    }
 
-        ★ 设计原则:
-          1. **主界面只做三件事**: 选角色 / 填配置 / 启动停止。
-             实时状态与日志移到次级窗口(用户要求) —— 它们信息密度高,
-             塞在主界面会把核心操作淹没, 那正是"毛坯感"的来源。
-          2. 卡片式分区 + 统一色板(见 ui_theme), 间距用 4 的倍数。
-          3. 顶部一条**状态横幅**: 圆点 + 一句话说明当前状态,
-             用户一眼看到"现在到底在不在跑"(托盘图标同色同步)。
-          4. 配置区用网格, 长提示放控件下方, 不参与争宽
-             (此前实测: 提示变长会把 Entry 挤到只剩几像素)。
-          5. 主机/副机配置不同 -> 切换角色时**重建配置区**。
+    def _build(self) -> None:
+        """主界面布局(v6, 2026-10-21 用户选定 A/B 双主题)。
+
+        ## 结构
+
+            [标记] Com Bridge          [深色] [状态] [日志]
+            ┌ 状态卡 ─────────────────────────────┐
+            │ ●运行中                        61 ms │
+            │ 192.168.10.12 → 192.168.10.201      │
+            │ [键盘鼠标] [音频同步]                │
+            └─────────────────────────────────────┘
+            ┌ 设置卡 ─────────────────────────────┐
+            │ [icon] 这台电脑的角色  [主电脑|副电脑] │
+            │ ───────────────────────────────────  │
+            │ [icon] 副电脑方位      [左|右|上|下]   │
+            │ ...                                  │
+            └─────────────────────────────────────┘
+                          (弹性空白)
+            [          启动服务           ]
+                      停止服务
+
+        ## 与 v5 的差别
+        v5 是"白纸 + 1px 细线, 一个盒子都不画", 用户判定"还不如上一版"。
+        v6 回到**卡片 + 层次 + 色彩**, 但用真实高斯阴影和整张位图渲染,
+        避免 v4 那种灰脏边和毛刺。
+
+        ## 两套配色
+        布局与所有尺寸完全相同, 只有颜色来自 ui_theme 的模块级常量;
+        切换主题时整体重建窗口(_on_toggle_theme -> _rebuild_ui)。
         """
         from . import ui_theme as T
+        from . import ui_render as R
 
-        self.root.title("Com Bridge")
-        self.root.geometry("620x640")
-        self.root.minsize(560, 580)
-        T.apply_theme(self.root)
+        root = self.root
+        root.title("Com Bridge")
+        T.apply_theme(root)
+        root.configure(background=T.BG)
 
-        root_bg = T.BG
-        self.root.columnconfigure(0, weight=1)
-        # 只让"卡片容器"占满高度, 底部固定
-        self.root.rowconfigure(2, weight=1)
+        # 重建前的状态: 主题切换会重跑本函数, 状态不能丢
+        prev_state = (self._state_var.get()
+                      if getattr(self, "_state_var", None) is not None
+                      else "未启动")
+        for w in root.winfo_children():
+            w.destroy()
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(2, weight=1)          # 弹性空白(仅用于撑满拉伸后的窗口)
+        # 状态文本仍然保留在 StringVar 里(不直接显示, 由状态胶囊表达;
+        # 但 _set_dot / _check_watchdog 等旧逻辑仍读它)
+        self._state_var = tk.StringVar(value=prev_state)
 
-        # ── 顶部标题栏 ──────────────────────────────────────────────
-        top = tk.Frame(self.root, background=root_bg)
-        top.grid(row=0, column=0, sticky="ew", padx=T.PAD_L,
-                 pady=(T.PAD_L, T.PAD_S))
-        top.columnconfigure(0, weight=1)
-        tk.Label(top, text="Com Bridge", background=root_bg,
-                 foreground=T.TEXT, font=T.FONT_TITLE).grid(
-            row=0, column=0, sticky="w")
-        tk.Label(top, text="双机键鼠越界 · 音频同步", background=root_bg,
-                 foreground=T.TEXT_MUTED, font=T.FONT_UI_SMALL).grid(
-            row=1, column=0, sticky="w", pady=(2, 0))
-        # 右上角: 状态窗口/日志窗口入口(用户要求放到按钮打开的次级窗口)
-        btns_top = tk.Frame(top, background=root_bg)
-        btns_top.grid(row=0, column=1, rowspan=2, sticky="e")
-        ttk.Button(btns_top, text="实时状态", style="Secondary.TButton",
-                   command=self._open_status_window).pack(side="left",
-                                                          padx=(0, T.PAD_S))
-        ttk.Button(btns_top, text="日志", style="Secondary.TButton",
-                   command=self._open_log_window).pack(side="left")
+        # ── 背板(浅色/深色目前都是纯色; 渐变保留能力) ────────────────
+        if T.BG_GRAD:
+            self._page_bg = tk.Label(root, bd=0, background=T.BG)
+            self._page_bg.place(x=0, y=0, relwidth=1, relheight=1)
 
-        # ── 状态横幅(圆点 + 文案 + 次要操作) ────────────────────────
-        banner, bi = T.card(self.root, padding=T.PAD_M)
-        banner.grid(row=1, column=0, sticky="ew", padx=T.PAD_L,
-                    pady=(0, T.PAD_S))
-        row = tk.Frame(bi, background=T.CARD)
-        row.pack(fill="x")
-        self._dot = tk.Label(row, text="●", background=T.CARD,
-                             foreground=T.TEXT_FAINT,
-                             font=("Segoe UI Symbol", 14))
-        self._dot.pack(side="left", padx=(0, T.PAD_S))
-        self._state_var = tk.StringVar(value="已停止")
-        tk.Label(row, textvariable=self._state_var, background=T.CARD,
-                 foreground=T.TEXT, font=T.FONT_UI,
-                 anchor="w").pack(side="left")
-        # 开机自启(静默, 不需要管理员)
-        # ★ 从"管理员自启(计划任务+RunLevel Highest)"改为 HKCU Run:
-        #   用户明确要求"不能加入需要用户确认的过程, 整个过程必须静默",
-        #   而创建最高权限计划任务必然弹 UAC(系统安全边界)。
+            def _paint_bg(ev):
+                # ★ 窗口高度现在是**内容决定**的, 渐变必须按实际尺寸重铺,
+                #   否则底部会露出一条没画出渐变的缝。
+                w, h = max(1, ev.width), max(1, ev.height)
+                self._page_photo = R.linear_gradient(w, h, T.BG_GRAD,
+                                                     self._page_bg)
+                self._page_bg.configure(image=self._page_photo)
+
+            root.bind("<Configure>", _paint_bg, add="+")
+        else:
+            self._page_bg = None
+
+        # 卡片容器左右留 CARD_M, 使**可见卡边**正好落在 PAGE_PAD
+        wrap_pad = T.PAGE_PAD - T.CARD_M
+        gap_between = 14 - T.CARD_M * 2        # pack 间距(可见卡间距 14)
+
+        # ── 顶栏: 已合并进状态卡, 这里不再单独占一行 ────────────────
+
+        # ── 顶部: 不再有独立一栏 ───────────────────────────────────
+        # ★★★ 2026-10-21 用户反馈: "深色、状态、日志三个按钮单独一栏太空了,
+        #   挪到播放暂停按钮的下边" —— 随后改主意: "把水位延迟和播放暂停
+        #   往下挪, 把这三个按钮挪到水位延迟上方"。
+        #   最终布局(自上而下): 三个按钮 → 延迟数字 → 播放/停止,
+        #   全部放在状态卡右侧那一列, 不再独占一行。
+
+        # ── 状态卡 ─────────────────────────────────────────────────
+        hero_wrap = tk.Frame(root, background=T.BG)
+        hero_wrap.grid(row=0, column=0, sticky="ew", padx=wrap_pad,
+                       pady=(16 - T.CARD_M, 0))
+        hero = T.Card(hero_wrap, bg=T.BG)
+        hero.pack(fill="x")
+        hin = tk.Frame(hero.body, background=T.CARD)
+        hin.pack(fill="x", padx=T.CARD_PAD_X, pady=16)
+
+        # ★★★ 2026-10-21 用户反馈: "左上角, 右下角全是大片空白, 运行中的
+        #   标识完全悬空, 不能更紧凑一点么"。
+        #   根因: 早先左右是两个独立容器 —— 左边一个整块(状态胶囊),
+        #   右边又竖着摞了三段(按钮 / 延迟 / 播放停止)。右侧总高度远大于
+        #   左侧, 于是左边顶部空、右下角也空。
+        #   修法: 改成**三行网格**, 左右内容按同一行对齐:
+        #        row0:  状态胶囊        |  深色/状态/日志
+        #        row1:  已连接…·缓冲…   |  延迟数字
+        #        row2:  键盘鼠标/音频同步 |  播放/停止
+        #   这样每一行左右都等高, 卡片高度由"三行"决定而不是"左一右三"。
+        grid = tk.Frame(hin, background=T.CARD)
+        grid.pack(fill="x")
+        grid.columnconfigure(0, weight=1)
+
+        # ---- row0: 状态胶囊 | 三个入口按钮 ----
+        r0 = tk.Frame(grid, background=T.CARD)
+        r0.grid(row=0, column=0, sticky="ew")
+        self._status = T.StatusBadge(r0, "idle", bg=T.CARD)
+        self._status.pack(side="left")
+
+        nav = tk.Frame(r0, background=T.CARD)
+        nav.pack(side="right")
+        theme_label = "浅色" if T.is_dark() else "深色"
+        T.PillButton(nav, "日志", self._open_log_window,
+                     bg=T.CARD).pack(side="right", padx=(6, 0))
+        T.PillButton(nav, "状态", self._open_status_window,
+                     bg=T.CARD).pack(side="right")
+        T.PillButton(nav, theme_label, self._on_toggle_theme,
+                     bg=T.CARD).pack(side="right", padx=(0, 6))
+
+        # ---- row1: 摘要(含音频缓冲) ----
+        # ★★★ 2026-10-21 用户决定: "保留左边的缓冲, 把缓冲的文本改为
+        #   音频缓冲避免歧义, 右侧的大缓冲延迟移除, 它使得音频缓冲看起来
+        #   像连接整体延迟"。
+        #   所以右侧那个 27px 大数字去掉了 —— 它只是**音频抖动缓冲**,
+        #   单独放大放在最显眼的位置, 会让人误以为是"整条链路的延迟"。
+        #   现在它作为摘要的一部分, 明确标成"音频缓冲"。
+        r1 = tk.Frame(grid, background=T.CARD)
+        r1.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self._hero_meta = tk.StringVar(value="选择角色后点 ▶")
+        self._hero_meta_lbl = tk.Label(
+            r1, textvariable=self._hero_meta, background=T.CARD,
+            foreground=T.TEXT_MUTED, font=T.FONT_UI_SMALL, anchor="w",
+            justify="left", padx=0)
+        self._hero_meta_lbl.pack(side="left")
+
+        # ---- row2: 标签 | 播放/停止 ----
+        r2 = tk.Frame(grid, background=T.CARD)
+        r2.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        tags = tk.Frame(r2, background=T.CARD)
+        tags.pack(side="left", pady=(6, 0))
+        for name in ("键盘鼠标", "音频同步"):
+            T.Tag(tags, name, bg=T.CARD).pack(side="left", padx=(0, 6))
+
+        ctl = tk.Frame(r2, background=T.CARD)
+        ctl.pack(side="right")
+        # ★ 用户指定顺序: "播放在左, 停止在右"。
+        self._start_btn = T.MediaButton(ctl, "play", self._on_start, size=28,
+                                        bg=T.CARD)
+        self._start_btn.pack(side="left")
+        self._stop_btn = T.MediaButton(ctl, "stop", self._on_stop, size=28,
+                                       bg=T.CARD)
+        self._stop_btn.pack(side="left", padx=(10, 0))
+
+        # ── 设置卡 ─────────────────────────────────────────────────
+        set_wrap = tk.Frame(root, background=T.BG)
+        set_wrap.grid(row=1, column=0, sticky="ew", padx=wrap_pad,
+                      pady=(gap_between, 0))
+        self._card_set = T.Card(set_wrap, bg=T.BG)
+        self._card_set.pack(fill="x")
+        body = self._card_set.body
+
+        # 角色行常驻(切换角色时不能重建发起回调的控件)
+        if getattr(self, "_role_var", None) is None:
+            self._role_var = tk.StringVar(value="server")
+        self._role_hint = tk.StringVar(
+            value=self._ROLE_DESC.get(self._role_var.get(), ""))
+        h1 = self._setting_row(body, "screen", 0, "这台电脑的角色",
+                               self._role_hint, top_border=False)
+        self._role_seg = T.Segmented(
+            h1, [("server", "主电脑"), ("agent", "副电脑")],
+            self._role_var.get(), command=self._select_role, bg=T.CARD)
+        self._role_seg.pack(side="right")
+
+        # 配置行(随角色重建; 容器常驻 -> pack 顺序不会乱)
+        self._cfgf = tk.Frame(body, background=T.CARD)
+        self._cfgf.pack(fill="x")
+
+        # 开机自启行常驻
         self._elev_var = tk.StringVar(value="检测中…")
-        self._elev_btn = ttk.Button(row, text="开机自启",
-                                    style="Secondary.TButton",
-                                    command=self._on_elev_toggle)
-        self._elev_btn.pack(side="right")
-        tk.Label(bi, textvariable=self._elev_var, background=T.CARD,
-                 foreground=T.TEXT_FAINT, font=T.FONT_UI_TINY,
-                 anchor="w").pack(fill="x", pady=(T.PAD_XS, 0))
+        h4 = self._setting_row(body, "power", 3, "开机自启",
+                               self._elev_var, top_border=True)
+        self._elev_sw = T.toggle(h4, on=False, bg=T.CARD,
+                                 command=self._on_autostart_switch)
+        self._elev_sw.pack(side="right")
+
+        # ── 底部提示 ───────────────────────────────────────────────
+        # ★ 用户要求"底边的大空白去掉": 最后一行的提示紧贴内容, 不再把
+        #   窗口撑到固定高度。窗口高度由内容决定(见下方 geometry)。
+        foot = tk.Frame(root, background=T.BG)
+        foot.grid(row=3, column=0, sticky="ew", padx=T.PAGE_PAD,
+                  pady=(10, 12))
+        tk.Label(foot, text="运行时最小化到托盘，关闭窗口不停止服务",
+                 background=T.BG, foreground=T.TEXT_FAINT,
+                 font=T.FONT_UI_TINY, padx=0).pack(side="left")
+
+        if not hasattr(self, "_status_win"):
+            self._status_win = None
+        if not hasattr(self, "_log_win"):
+            self._log_win = None
+
+        # 建配置区 -> 恢复状态 -> 定尺寸
+        self._rebuild_config_for(self._role_var.get())
+        self._restore_visuals(prev_state)
+        # ★★★ 窗口尺寸 = 内容的实际需求高度。
+        #   早先固定 660, 而 v9 的内容只有 ~600, 底部就空出近 60px 的
+        #   白区(用户截图里指出的"底边的大空白")。现在按
+        #   winfo_reqheight 设高度, 内容多少窗口就多高。
+        try:
+            self.root.update_idletasks()
+            need = int(self.root.winfo_reqheight())
+            h = max(480, need)
+            self.root.geometry(f"{T.WINDOW_W}x{h}")
+            self.root.minsize(T.WINDOW_W, h)
+        except tk.TclError:
+            pass
         self.root.after(200, self._refresh_elev_state)
 
-        # ── 中间可滚动区: 角色 + 配置 ───────────────────────────────
-        mid = tk.Frame(self.root, background=root_bg)
-        mid.grid(row=2, column=0, sticky="nsew", padx=T.PAD_L)
-        mid.columnconfigure(0, weight=1)
-        # 配置行不参与拉伸: 多余空间留在最底部, 卡片自然靠上排布
-        mid.rowconfigure(1, weight=0)
-        mid.rowconfigure(2, weight=1)
+    # -- 布局小工具 ----------------------------------------------------
 
-        # 角色选择卡片(两个并排, 选中态用蓝色高亮)
-        role_card, role_inner = T.card(mid, title="这台电脑的角色")
-        role_card.grid(row=0, column=0, sticky="ew", pady=(0, T.PAD_S))
-        self._role_var = tk.StringVar(value="server")
-        self._role_boxes: dict[str, tk.Frame] = {}
-        self._role_labels: dict[str, tuple[tk.Label, tk.Label]] = {}
-        rrow = tk.Frame(role_inner, background=T.CARD)
-        rrow.pack(fill="x")
-        for col, (value, title, desc) in enumerate((
-            ("server", "主电脑", "接键鼠与音箱\n输出到本机声卡"),
-            ("agent", "副电脑", "本机扬声器静音\n把声音送到主电脑"),
-        )):
-            rrow.columnconfigure(col, weight=1)
-            box = tk.Frame(rrow, background=T.CARD_ALT,
-                           highlightbackground=T.BORDER,
-                           highlightthickness=2, cursor="hand2")
-            box.grid(row=0, column=col, sticky="nsew",
-                     padx=(0, T.PAD_S) if col == 0 else (T.PAD_S, 0))
-            inner = tk.Frame(box, background=T.CARD_ALT,
-                             padx=T.PAD_M, pady=T.PAD_M)
-            inner.pack(fill="both", expand=True)
-            lbl_t = tk.Label(inner, text=title, background=T.CARD_ALT,
-                             foreground=T.TEXT, font=T.FONT_SUBTITLE,
-                             anchor="w")
-            lbl_t.pack(fill="x")
-            lbl_d = tk.Label(inner, text=desc, background=T.CARD_ALT,
-                             foreground=T.TEXT_MUTED, font=T.FONT_UI_TINY,
-                             anchor="w", justify="left")
-            lbl_d.pack(fill="x", pady=(2, 0))
-            for widget in (box, inner, lbl_t, lbl_d):
-                widget.bind("<Button-1>",
-                            lambda _e, v=value: self._select_role(v))
-            self._role_boxes[value] = box
-            self._role_labels[value] = (lbl_t, lbl_d)
+    def _setting_row(self, parent, icon: str, index: int, title: str,
+                     sub, *, top_border: bool = True) -> tk.Frame:
+        """一行设置: [图标徽章] 标题/说明 ……… 右侧控件。
 
-        # 配置区(随角色重建)
-        self._cfgf = tk.Frame(mid, background=root_bg)
-        self._cfgf.grid(row=1, column=0, sticky="new")
-        self._cfgf.columnconfigure(0, weight=1)
-        self._build_config_server()
-        self._select_role(self._role_var.get(), fire=False)
+        ★ 高度固定 66px: 四行等高才有节奏感; 行高交给内容撑会被
+          "说明有没有换行"带歪。
+        """
+        from . import ui_theme as T
+        row = tk.Frame(parent, background=T.CARD, height=72)
+        row.pack(fill="x")
+        row.pack_propagate(False)
+        if top_border:
+            tk.Frame(row, background=T.HAIR, height=1, bd=0).pack(fill="x")
+        holder = tk.Frame(row, background=T.CARD)
+        holder.pack(fill="both", expand=True, padx=T.CARD_PAD_X)
 
-        # ── 底部操作条 ──────────────────────────────────────────────
-        bottom = tk.Frame(self.root, background=root_bg)
-        bottom.grid(row=3, column=0, sticky="ew", padx=T.PAD_L,
-                    pady=(T.PAD_S, T.PAD_L))
-        bottom.columnconfigure(0, weight=1)
-        self._start_btn = ttk.Button(bottom, text="启动服务",
-                                     style="Primary.TButton",
-                                     command=self._on_start)
-        self._start_btn.grid(row=0, column=0, sticky="ew")
-        self._stop_btn = ttk.Button(bottom, text="停止服务",
-                                    style="Danger.TButton",
-                                    command=self._on_stop, state="disabled")
-        self._stop_btn.grid(row=0, column=1, sticky="e", padx=(T.PAD_S, 0))
+        T.Badge(holder, icon, size=30, index=index,
+                bg=T.CARD).pack(side="left", padx=(0, 12))
+        tf = tk.Frame(holder, background=T.CARD)
+        tf.pack(side="left")
+        tk.Label(tf, text=title, background=T.CARD, foreground=T.TEXT,
+                 font=T.FONT_UI, anchor="w", padx=0).pack(anchor="w")
+        kw = ({"textvariable": sub} if isinstance(sub, tk.Variable)
+              else {"text": sub})
+        tk.Label(tf, **kw, background=T.CARD, foreground=T.TEXT_FAINT,
+                 font=T.FONT_UI_SMALL, anchor="w", justify="left",
+                 padx=0).pack(anchor="w", pady=(2, 0))
+        return holder
 
-        # 日志/状态窗口对象(首次点击时创建)
-        self._status_win = None
-        self._log_win = None
+    # -- 主题切换 ------------------------------------------------------
 
-    # -- 角色选择(卡片高亮) ---------------------------------------------
+    def _theme_pref(self) -> str:
+        return str(self._load_cfg().get("ui_theme") or "auto")
+
+    def _resolve_mode(self) -> str:
+        """auto -> 跟随 Windows; 显式 light/dark 就用它。"""
+        from . import ui_theme as T
+        pref = self._theme_pref()
+        if pref in ("light", "dark"):
+            return pref
+        return "dark" if T.system_prefers_dark() else "light"
+
+    def _on_toggle_theme(self) -> None:
+        """顶栏"深色/浅色"按钮: 直接切到相反配色并记住。"""
+        from . import ui_theme as T
+        new = "light" if T.current_mode() == "dark" else "dark"
+        try:
+            from . import config as _cfg
+            _cfg.update(ui_theme=new)
+        except Exception:  # noqa: BLE001
+            pass
+        self._rebuild_ui()
+
+    def _rebuild_ui(self) -> None:
+        """按当前主题偏好整体重建窗口(控件颜色取自模块级常量)。
+
+        ★ 次级窗口也要重建: 它们是在"打开时的主题"下构建的, 而主题切换
+          发生在另一个时刻。销毁后按原可见性重新打开, 比逐控件改色可靠。
+        """
+        from . import ui_theme as T
+        T.set_mode(self._resolve_mode())
+        was_visible: dict[str, bool] = {}
+        for name in ("_status_win", "_log_win"):
+            w = getattr(self, name, None)
+            try:
+                was_visible[name] = bool(w is not None and w.visible)
+            except Exception:  # noqa: BLE001
+                was_visible[name] = False
+            if w is not None:
+                try:
+                    w.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            self._build()
+        except tk.TclError:
+            pass
+        for name, vis in was_visible.items():
+            w = getattr(self, name, None)
+            if vis and w is not None:
+                try:
+                    w.show()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _restore_visuals(self, state_text: str) -> None:
+        """重建后把"界面表现"恢复成运行时真实状态。
+
+        ★ 重建会丢掉所有视觉状态(按钮可用性/状态胶囊/圆点), 所以主题
+          切换后必须重算一遍, 否则界面上会出现"正在运行但按钮显示可启动"。
+        """
+        try:
+            self._set_state(state_text)
+        except tk.TclError:
+            return
+        running = self._role is not None
+        waiting = self._waiting_for_host() is not None
+        if running:
+            kind = "run"
+        elif waiting:
+            kind = "wait"
+        else:
+            kind = "idle"
+        self._set_hero_state(kind)
+        try:
+            self._start_btn.set_enabled(not (running or waiting))
+            self._stop_btn.set_enabled(bool(running or waiting))
+        except tk.TclError:
+            pass
+        self._sync_tray(bool(running))
+
+    # -- 状态区(三态) --------------------------------------------------
+
+    def _set_hero_state(self, kind: str) -> None:
+        """切换状态胶囊: run(绿) / wait(琥珀) / idle(灰)。
+
+        ★ idle 时若状态文本不是"未启动"(例如"启动失败"/"已取消"),
+          胶囊就直接显示那段文本 —— 否则用户只看到灰色"未启动",
+          根本不知道刚才失败了。
+        """
+        badge = getattr(self, "_status", None)
+        label = None
+        if kind == "idle":
+            txt = ""
+            try:
+                txt = self._state_var.get()
+            except (tk.TclError, AttributeError):
+                txt = ""
+            if txt and txt not in ("未启动", "运行中", "等待主电脑"):
+                label = txt
+        if badge is not None:
+            try:
+                badge.set_state(kind, label)
+            except tk.TclError:
+                pass
+        # ★★★ 播放/停止按钮的颜色是**唯一的状态载体**(无底色、无文字),
+        #   所以必须在这里统一传播: 未启动黑/红, 等待黄, 连接成功绿。
+        for btn in (getattr(self, "_start_btn", None),
+                    getattr(self, "_stop_btn", None)):
+            if btn is not None and hasattr(btn, "set_state"):
+                try:
+                    btn.set_state(kind)
+                except tk.TclError:
+                    pass
+        if kind == "idle":
+            # 右侧大数字已移除(见 row1 的说明), 这里不再需要清占位符。
+            pass
+
+    # -- 角色选择 ------------------------------------------------------
 
     def _select_role(self, value: str, fire: bool = True) -> None:
-        """选中角色卡片: 高亮选中项并重建配置区。"""
-        from . import ui_theme as T
+        """选中角色: 同步分段控件 + 角色说明 + 重建配置行。"""
         self._role_var.set(value)
-        for v, box in self._role_boxes.items():
-            selected = (v == value)
-            bg = T.PRIMARY if selected else T.CARD_ALT
-            border = T.PRIMARY if selected else T.BORDER
-            box.configure(background=bg, highlightbackground=border)
-            for child in box.winfo_children():
-                child.configure(background=bg)
-                for sub in child.winfo_children():
-                    try:
-                        sub.configure(background=bg)
-                    except tk.TclError:
-                        pass
-            lbl_t, lbl_d = self._role_labels[v]
-            lbl_t.configure(foreground="#FFFFFF" if selected else T.TEXT)
-            lbl_d.configure(foreground="#DBEAFE" if selected
-                            else T.TEXT_MUTED)
+        seg = getattr(self, "_role_seg", None)
+        if seg is not None:
+            try:
+                seg.set_value(value)
+            except tk.TclError:
+                pass
+        try:
+            self._role_hint.set(self._ROLE_DESC.get(value, ""))
+        except (tk.TclError, AttributeError):
+            pass
         if fire:
             self._on_role_change()
         else:
             self._rebuild_config_for(value)
 
     def _rebuild_config_for(self, value: str) -> None:
-        from . import ui_theme as T
-        for w in self._cfgf.winfo_children():
-            w.destroy()
-        self._cfgf.columnconfigure(0, weight=1)
-        self._cfgf.rowconfigure(0, weight=1)
+        """重建配置行(只重建 ``_cfgf`` 的子控件, 容器本身保留)。"""
+        self._clear_config()
         if value == "agent":
             self._build_config_agent()
         else:
@@ -413,98 +666,69 @@ class ComBridgeGui:
     # -- 配置区构建(按角色) ---------------------------------------------
 
     def _clear_config(self) -> None:
+        """销毁配置行并清引用, 否则后续 configure 会抛 TclError。"""
         for w in self._cfgf.winfo_children():
             w.destroy()
-        # 旧控件的引用必须清掉, 否则 configure 已销毁的控件会抛 TclError
-        self._side_box = None
-        self._side_hint = None
-        self._host_entry = None
-        self._jitter_entry = None
+        self._side_seg = None
+        self._side_var = None
+        self._host_field = None
+        self._jitter_field = None
+
+    def _load_cfg(self) -> dict:
+        try:
+            from . import config as _cfg
+            return dict(_cfg.load())
+        except Exception:  # noqa: BLE001
+            return {}
 
     def _build_config_server(self) -> None:
-        """主电脑配置: 副电脑方位 + 延迟目标(现代化卡片版)。"""
+        """主电脑配置: 副电脑方位 + 延迟目标。"""
         from . import ui_theme as T
-        parent = self._cfgf
-        card, inner = T.card(parent, title="主电脑配置")
-        card.pack(fill="x")
-        self._side_var = tk.StringVar(value="right")
-        self._build_field(
-            inner, row=0, label="副电脑方位",
-            hint="副机自动采用这里下发的方位, 无需在副机上重复设置",
-            widget_factory=lambda wrap: ttk.Combobox(
-                wrap, textvariable=self._side_var, values=SIDES,
-                state="readonly", width=10))
-        self._side_box = self._last_field_widget
-        self._jitter_var = tk.StringVar(value="60")
-        self._build_field(
-            inner, row=1, label="延迟目标 (ms)",
-            hint="音频抖动缓冲: 越大越稳, 但延迟越高",
-            widget_factory=lambda wrap: ttk.Entry(wrap, textvariable=self._jitter_var,
-                                     width=10))
-        self._jitter_entry = self._last_field_widget
+        saved = self._load_cfg()
+        side = str(saved.get("side") or "right")
+        if side not in SIDES:
+            side = "right"
+        self._side_var = tk.StringVar(value=side)
+        h = self._setting_row(self._cfgf, "layout", 1, "副电脑方位",
+                              "副机自动采用这里下发的方位")
+        self._side_seg = T.Segmented(
+            h, [(s, SIDE_ZH[s]) for s in SIDES], side,
+            command=self._on_side_pick, bg=T.CARD)
+        self._side_seg.pack(side="right")
+        self._build_jitter_row()
 
-    def _build_config_agent(self) -> None:
-        """副电脑配置: 主电脑 IP + 延迟目标(现代化卡片版)。"""
-        from . import ui_theme as T
-        card, inner = T.card(self._cfgf, title="副电脑配置")
-        card.pack(fill="x")
-        inner.columnconfigure(1, weight=1)
-        # ★ IP 会从配置里读回(用户要求"记忆 IP"), 所以这里取当前记忆值
-        remembered = ""
+    def _on_side_pick(self, value: str) -> None:
+        """方位分段回调: 写回英文内部值并立即持久化。"""
+        if self._side_var is not None:
+            self._side_var.set(value)
         try:
             from . import config as _cfg
-            remembered = str(_cfg.load().get("server_host") or "")
-        except Exception:  # noqa: BLE001
-            remembered = ""
-        self._host_var = tk.StringVar(value=remembered)
-        self._build_field(
-            inner, row=0, label="主电脑 IP",
-            hint="填主电脑的 IP(在主电脑上运行 ipconfig 查看); 会自动记住",
-            widget_factory=lambda wrap: ttk.Entry(wrap, textvariable=self._host_var),
-            wide=True)
-        self._host_entry = inner.winfo_children()[-1]
-        self._jitter_var = tk.StringVar(value="60")
-        try:
-            from . import config as _cfg
-            self._jitter_var.set(str(_cfg.load().get("jitter_ms") or 60))
+            _cfg.update(side=value)
         except Exception:  # noqa: BLE001
             pass
-        self._build_field(
-            inner, row=1, label="延迟目标 (ms)",
-            hint="音频抖动缓冲; 方位无需填写 —— 自动采用主电脑下发的值",
-            widget_factory=lambda wrap: ttk.Entry(wrap, textvariable=self._jitter_var,
-                                     width=10))
-        self._jitter_entry = inner.winfo_children()[-1]
 
-    def _build_field(self, parent, row: int, label: str, hint: str,
-                     widget_factory, wide: bool = False) -> None:
-        """统一的"标签 + 控件 + 下方提示"结构。
-
-        ★ 提示必须放**控件下方独立一行**: 曾把它塞在同一行,
-          提示变长时 Entry 被挤到只剩几像素(实测踩到)。
-        ★ 内部套一层 Frame 并用 grid 排版, 且**控件必须建在这个 Frame 里**
-          —— 不能建在 card 的 inner 上(inner 已用 pack 放标题,
-          tkinter 不允许同一容器混用 pack 与 grid, 实测 TclError)。
-        """
+    def _build_jitter_row(self) -> None:
+        """延迟目标行(两种角色共用)。"""
         from . import ui_theme as T
-        wrap = tk.Frame(parent, background=T.CARD)
-        wrap.pack(fill="x")
-        wrap.columnconfigure(1, weight=1)
-        tk.Label(wrap, text=label, background=T.CARD,
-                 foreground=T.TEXT_MUTED, font=T.FONT_UI_SMALL,
-                 anchor="w").grid(row=0, column=0, sticky="w",
-                                  padx=(0, T.PAD_M), pady=(T.PAD_S, 2))
-        w = widget_factory(wrap)
-        if wide:
-            w.grid(row=0, column=1, sticky="ew", pady=(T.PAD_S, 2))
-        else:
-            w.grid(row=0, column=1, sticky="w", pady=(T.PAD_S, 2))
-        tk.Label(wrap, text=hint, background=T.CARD,
-                 foreground=T.TEXT_FAINT, font=T.FONT_UI_TINY,
-                 anchor="w", justify="left").grid(
-            row=1, column=1, sticky="w", pady=(0, T.PAD_XS))
-        self._last_field_widget = w
+        jit = self._load_cfg().get("jitter_ms") or 60
+        self._jitter_var = tk.StringVar(value=_fmt_num(jit))
+        h = self._setting_row(self._cfgf, "latency", 2, "延迟目标",
+                              "音频抖动缓冲，越大越稳")
+        self._jitter_field = T.Field(h, self._jitter_var, width=78,
+                                     height=32, suffix="ms", bg=T.CARD)
+        self._jitter_field.pack(side="right")
 
+    def _build_config_agent(self) -> None:
+        """副电脑配置: 主电脑 IP + 延迟目标。"""
+        from . import ui_theme as T
+        remembered = str(self._load_cfg().get("server_host") or "")
+        self._host_var = tk.StringVar(value=remembered)
+        h = self._setting_row(self._cfgf, "layout", 1, "主电脑 IP",
+                              "在主电脑上运行 ipconfig 查看")
+        self._host_field = T.Field(h, self._host_var, width=176, height=32,
+                                   justify="left", bg=T.CARD)
+        self._host_field.pack(side="right")
+        self._build_jitter_row()
     # -- 角色切换 ------------------------------------------------------
 
     def _on_role_change(self) -> None:
@@ -547,7 +771,7 @@ class ComBridgeGui:
         sys.stdout = self._tee
         self._set_state("启动中...")
         self._mark_pending("start")
-        self._start_btn.configure(state="disabled")
+        self._start_btn.set_enabled(False)
 
         # ★ 记住本次配置(含"运行中"标志) —— 这是开机自动重连的依据。
         #   在**启动前**写: 即使启动失败, 下次也照用户意图再试一次
@@ -914,11 +1138,15 @@ class ComBridgeGui:
             def apply() -> None:
                 try:
                     if enabled:
-                        self._elev_var.set("开机自启: 已启用(静默启动)")
-                        self._elev_btn.configure(text="关闭自启")
+                        # ★ 这是行内小字(行标签已经写了"开机自启"),
+                        #   所以只说状态, 不重复主语。
+                        self._elev_var.set("已启用 —— 登录后静默启动到托盘")
                     else:
-                        self._elev_var.set("未启用开机自启")
-                        self._elev_btn.configure(text="开机自启")
+                        self._elev_var.set("未启用")
+                    # 同步开关位置(Canvas 胶囊)
+                    sw = getattr(self, "_elev_sw", None)
+                    if sw is not None and hasattr(sw, "set_on"):
+                        sw.set_on(enabled)
                 except tk.TclError:
                     pass
 
@@ -927,12 +1155,14 @@ class ComBridgeGui:
         _th.Thread(target=worker, daemon=True,
                    name="AutostartQuery").start()
 
-    def _on_elev_toggle(self) -> None:
-        """按钮入口: 启用/关闭开机自启。**全程静默, 不弹 UAC**。
+    def _on_autostart_switch(self, want_on: bool) -> None:
+        """Canvas 开关回调: 直接把自启设成目标状态(而不是盲翻转)。
 
-        ★ 用户要求: "不能加入需要用户确认的过程，整个过程必须静默"。
-          注册表读写是同步且极快的(实测 <50ms), 但仍放后台线程执行 ——
-          保持主线程永不阻塞的原则。
+        ★ 为什么不用盲翻转: 开关是"目标态"语义, 而翻转式入口在
+          "开关位置与实际状态短暂不一致"(异步查询期间)时会把用户想要
+          的状态做反。这里按 want_on 显式设置。
+        ★ 后台回调一律走 `_post_ui`(tkinter 非线程安全, 实测踩过
+          "main thread is not in main loop")。
         """
         if getattr(self, "_elev_toggling", False):
             return                      # 防重复点击
@@ -944,15 +1174,16 @@ class ComBridgeGui:
 
         def worker() -> None:
             from . import autostart
-            was_on = False
             try:
-                was_on = autostart.is_enabled()
+                cur = autostart.is_enabled()
             except Exception:  # noqa: BLE001
-                was_on = False
-            if was_on:
-                ok, msg = autostart.disable()
-            else:
+                cur = False
+            if cur == want_on:
+                ok, msg = True, ("已是目标状态" if want_on else "已是关闭状态")
+            elif want_on:
                 ok, msg = autostart.enable()
+            else:
+                ok, msg = autostart.disable()
 
             def done() -> None:
                 self._elev_toggling = False
@@ -970,7 +1201,18 @@ class ComBridgeGui:
 
         import threading as _th
         _th.Thread(target=worker, daemon=True,
-                   name="AutostartToggle").start()
+                   name="AutostartSwitch").start()
+
+    def _on_elev_toggle(self) -> None:
+        """翻转开机自启(兼容旧入口 / 托盘菜单)。
+
+        **全程静默, 不弹 UAC** —— 用户要求"不能加入需要用户确认的过程,
+        整个过程必须静默"。注册表读写极快(实测 <50ms), 但仍放后台线程
+        执行, 保持主线程永不阻塞; 结果经 `_post_ui` 回到主线程。
+        """
+        sw = getattr(self, "_elev_sw", None)
+        want = not (sw.is_on() if hasattr(sw, "is_on") else False)
+        self._on_autostart_switch(want)
 
     # -- 状态轮询 ------------------------------------------------------
 
@@ -1001,7 +1243,9 @@ class ComBridgeGui:
                 self._clear_pending()
                 if kind == "started":
                     self._set_state(f"运行中 · {_ROLE_ZH.get(payload, payload)}")
-                    self._stop_btn.configure(state="normal")
+                    self._set_hero_state("run")
+                    self._stop_btn.set_enabled(True)
+                    self._start_btn.set_enabled(False)
                     self._sync_tray(True)
                     # ★★★ 主电脑启动后必须**主动放弃窗口焦点** ——
                     #   本进程窗口是前台时, Windows 不会把键盘事件交给
@@ -1010,23 +1254,26 @@ class ComBridgeGui:
                     if payload == "server":
                         self._release_focus_for_hook()
                 elif kind == "stopped":
-                    self._set_state("已停止")
-                    self._stop_btn.configure(state="disabled")
-                    self._start_btn.configure(state="normal")
+                    self._set_state("未启动")
+                    self._set_hero_state("idle")
+                    self._stop_btn.set_enabled(False)
+                    self._start_btn.set_enabled(True)
                     self._stop_thread = None
                     self._sync_tray(False)
                 elif kind == "error":
-                    self._set_state(f"启动失败: {payload}")
-                    self._start_btn.configure(state="normal")
-                    self._stop_btn.configure(state="disabled")
+                    self._set_state(f"启动失败")
+                    self._set_hero_state("idle")
+                    self._start_btn.set_enabled(True)
+                    self._stop_btn.set_enabled(False)
                     self._sync_tray(False)
                     self._role_thread = None
                 elif kind == "cancelled":
                     # 等待主电脑期间被用户取消 —— 不是错误
                     self._set_state("已取消")
+                    self._set_hero_state("idle")
                     self._pending_role = None
-                    self._start_btn.configure(state="normal")
-                    self._stop_btn.configure(state="disabled")
+                    self._start_btn.set_enabled(True)
+                    self._stop_btn.set_enabled(False)
                     self._sync_tray(False)
                     self._role_thread = None
                     self._stop_thread = None
@@ -1084,10 +1331,15 @@ class ComBridgeGui:
         if wait is not None:
             _phase, elapsed, attempts = wait
             self._pending_since = now_us() / 1e6
-            self._set_state(f"等待主电脑…(已等 {elapsed:.0f}s, "
-                            f"探测 {attempts} 次)")
+            # ★ 状态区切成"等待"配色(琥珀), 摘要显示等待进度。
+            #   主按钮保持"启动服务"且禁用 —— 没有"取消等待"按钮
+            #   (用户 2026-10-21 明确要求), 想中止就点"停止"。
+            self._set_state("等待主电脑")
+            self._set_hero_state("wait")
             try:
-                self._stop_btn.configure(state="normal")
+                self._hero_meta.set(
+                    f"已等 {elapsed:.0f}s · 探测 {attempts} 次 · 就绪后自动握手")
+                self._stop_btn.set_enabled(True)
             except tk.TclError:
                 pass
             # 托盘提示同步一次就够(每 500ms 刷 Shell_NotifyIcon 没必要),
@@ -1113,13 +1365,13 @@ class ComBridgeGui:
             f"若为启动失败, 请确认端口未被占用、声卡可用。"
         )
         if kind == "start":
-            self._start_btn.configure(state="normal")
-            self._stop_btn.configure(state="disabled")
+            self._start_btn.set_enabled(True)
+            self._stop_btn.set_enabled(False)
             self._role_thread = None
         else:
             self._stop_thread = None
-            self._start_btn.configure(state="normal")
-            self._stop_btn.configure(state="disabled")
+            self._start_btn.set_enabled(True)
+            self._stop_btn.set_enabled(False)
 
     def collect_status(self) -> dict:
         """收集实时状态, 供状态窗口拉取(主界面不再显示这些)。
@@ -1163,9 +1415,23 @@ class ComBridgeGui:
                         txinfo += f" 失败 {tx.failed}"
                     txinfo += f" -> {tx.addr[0]}"
                 ld = role._listener.diag()
+                # ★★★ 2026-10-21 用户指出: "键盘已经改了, 不是 raw input 了,
+                #   这个数据是不是也该同步修改?"
+                #   查实: 主电脑确实以 register_keyboard=False 启动
+                #   (见 server.py —— 注册键盘 RawInput 会让低级键盘钩子
+                #   收不到任何按键, 这是键盘跨屏失效的根因修复)。
+                #   所以:
+                #     * 鼠标确实走 RawInput
+                #     * 键盘走低级钩子(按键计数在下面的"键盘钩子"行里)
+                #   旧文案一律写"原始输入 N 鼠标/M 键盘", 那个 M 恒为 0,
+                #   既误导(以为键盘也走 RawInput 且坏了)又重复。
+                #   现在按**实际采集路径**生成文案。
+                if getattr(role._listener, "register_keyboard", False):
+                    src = f"原始输入 {ld['mouse']} 鼠标/{ld['key']} 键盘"
+                else:
+                    src = f"原始输入 {ld['mouse']} 鼠标 · 键盘走低级钩子"
                 out["input"] = (
-                    f"控制权 {state} | 原始输入 {ld['mouse']} 鼠标/"
-                    f"{ld['key']} 键盘{txinfo}", 1 if outside else 0)
+                    f"控制权 {state} | {src}{txinfo}", 1 if outside else 0)
             hook = getattr(role, "_hook", None)
             if hook is not None:
                 hd = hook.diag()
@@ -1246,35 +1512,91 @@ class ComBridgeGui:
                 self._log_win.append(line)
 
     def _sync_tray(self, running: bool) -> None:
-        """托盘图标跟随服务状态(用户要求: 直观分辨是否已启动)。"""
+        """托盘图标跟随服务状态(用户要求: 直观分辨是否已启动)。
+
+        ★ 三态(2026-10-21 定稿):
+            connected  绿点  已连接
+            waiting    黄点  已启动但未连接(等待主电脑)
+            off        无点  未启动
+        """
         tray = getattr(self, "_tray", None)
         try:
             role_txt = _ROLE_ZH.get(self._role_var.get(), "服务")
             if tray is not None:
                 if running and self._role is not None:
-                    tray.set_status(True, f"Com Bridge · {role_txt}运行中")
+                    tray.set_status(True, f"Com Bridge · {role_txt}运行中",
+                                    state="connected")
+                elif self._waiting_for_host() is not None:
+                    # 正在等主电脑: 已启动但未连接 -> 黄点
+                    tray.set_status(False, "Com Bridge · 等待主电脑…",
+                                    state="waiting")
                 else:
-                    tray.set_status(False, "Com Bridge · 已停止")
+                    tray.set_status(False, "Com Bridge · 已停止",
+                                    state="off")
             self._set_dot(running)
         except Exception:  # noqa: BLE001
             pass
-
-    def _set_dot(self, running: bool) -> None:
-        """主界面状态圆点: 绿=运行中, 灰=停止, 红=失败。"""
-        from . import ui_theme as T
-        dot = getattr(self, "_dot", None)
-        if dot is None:
-            return
+        # ★ 状态区摘要: 运行中显示对端 + 音频缓冲(主界面上唯一的状态信息,
+        #   详细数据仍在「实时状态」窗口 —— 用户要求不搬进主界面)。
+        #   ★ 2026-10-21: 早先这个数字被单独拎出来放大显示, 用户指出
+        #   "它使得音频缓冲看起来像连接整体延迟", 现已合回摘要一句。
         try:
-            state = self._state_var.get()
-            if "失败" in state:
-                dot.configure(foreground=T.DANGER)
-            elif running:
-                dot.configure(foreground=T.SUCCESS)
-            else:
-                dot.configure(foreground=T.TEXT_FAINT)
+            if running and self._role is not None:
+                # ★★★ 2026-10-21 用户要求把"运行中"拆成两个视觉状态:
+                #   "等待连接时三角变黄, 连接成功时三角变绿"。
+                #   所以这里先判断**是否真的连上了对端**, 再决定用 run 还是
+                #   wait 配色 —— 早先一律 "_set_hero_state('run')", 于是
+                #   "已启动但还没连上"也显示成绿色, 与事实不符。
+                role = self._role
+                parts = []
+                # ★★★ 2026-10-21 用户决定: 大数字移除后, 音频缓冲回到摘要里,
+                #   但要**明确标成"音频缓冲"**, 避免被当成整条链路的连接延迟。
+                #   再进一步: 用括号把它挂在连接状态**后面**, 读作
+                #   "已连接 X（音频缓冲 93 ms）" —— 是这条连接的属性,
+                #   而不是与"已连接"并列的另一项指标(用 · 分隔会读成并列)。
+                if isinstance(role, Server):
+                    connected = bool(role.peer_addr)
+                    if connected:
+                        head = f"已连接 {role.peer_addr}"
+                    else:
+                        head = "等待副电脑接入"
+                    extra = ""
+                    if role._peer is not None:
+                        try:
+                            lat = role._peer.buffered_ms()
+                            extra = f"（音频缓冲 {lat:.0f} ms）"
+                        except Exception:  # noqa: BLE001
+                            pass
+                    parts.append(head + extra)
+                else:
+                    host = getattr(role, "server_host", "") or ""
+                    clock = getattr(role, "_control", None)
+                    connected = bool(clock is not None
+                                     and getattr(clock, "clock", None)
+                                     and clock.clock.synced)
+                    head = f"主电脑 {host}" if host else "副电脑"
+                    if not connected:
+                        head += " · 等待对时"
+                    extra = ""
+                    if clock is not None and getattr(clock, "clock", None):
+                        try:
+                            off = clock.clock.offset_us / 1000.0
+                            extra = f"（对时偏差 {off:+.1f} ms）"
+                        except Exception:  # noqa: BLE001
+                            pass
+                    parts.append(head + extra)
+                self._set_hero_state("run" if connected else "wait")
+                self._hero_meta.set("".join(parts))
         except tk.TclError:
             pass
+
+    def _set_dot(self, running: bool) -> None:
+        """兼容旧接口: v6 的状态颜色由状态胶囊(StatusBadge)表达。
+
+        保留这个空实现是因为 `_sync_tray` 仍在调用它; 真正换色发生在
+        `_set_hero_state("run"/"wait"/"idle")`。
+        """
+        _ = running
 
     def _post_ui(self, fn) -> bool:
         """从**后台线程**安全地投递一个 UI 回调到主线程。
@@ -1309,6 +1631,7 @@ class ComBridgeGui:
                 on_show=lambda: self._post_ui(self._show_from_tray),
                 on_start=lambda: self._post_ui(self._on_start),
                 on_stop=lambda: self._post_ui(self._on_stop),
+                on_log=lambda: self._post_ui(self._open_log_window),
                 on_exit=lambda: self._post_ui(self._quit_app),
             )
             ok = self._tray.start()

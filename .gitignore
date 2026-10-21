@@ -36,3 +36,32 @@ noise_*.wav
 
 # 诊断产物(截图等)
 tools/_paint_probe/
+
+# 视觉稿渲染产物(PNG 体积大, 由 tools/ui_mockup 重新生成)
+tools/_ui_shots/
+
+# 图标生成产物(由 tools/icons/gen_icons.py 重新生成)
+tools/icons/_icons/
+
+# 托盘图标生成产物(由 tools/icons/make_tray_spec.py 重新生成)
+tools/icons/_tray_win/
+tools/icons/_tray_final/
+
+# 应用图标生成产物(由 tools/icons/gen_app_icon.py --check 重新生成)
+tools/icons/_app_icon/
+
+# 早期托盘图标迭代稿(gen_tray_v4/v5/v6/v7/bold 等已被 gen_app_icon 统一取代)
+tools/icons/gen_tray_v4.py
+tools/icons/gen_tray_v5.py
+tools/icons/gen_tray_v6.py
+tools/icons/gen_tray_v7.py
+tools/icons/gen_tray_bold.py
+tools/icons/gen_tray_bold2.py
+tools/icons/gen_tray_bold3.py
+tools/icons/gen_icons.py
+tools/icons/gen_tray_final.py
+tools/icons/gen_tray_windows.py
+tools/icons/make_tray_spec.py
+tools/icons/make_v6_spec.py
+tools/icons/make_spec_sheet.py
+tools/icons/check_icons.py

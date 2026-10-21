@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<style>
+  html,body{margin:0;padding:0}
+  *{box-sizing:border-box;-webkit-font-smoothing:antialiased}
+  body{font-family:"Segoe UI Variable Display","Segoe UI","Microsoft YaHei UI",system-ui,sans-serif;
+       width:620px;height:690px;display:flex;flex-direction:column;overflow:hidden;
+       background:#0F1115;color:#E6E8EC}
+  .tb{height:30px;flex:none;display:flex;align-items:center;gap:8px;padding:0 12px 0 10px;
+      background:#0B0D11;border-bottom:1px solid #1C2029;font-size:12px;color:#8B93A1}
+  .tb .cap{flex:1}
+  .wb{width:30px;height:22px;display:grid;place-items:center;font-size:11px;color:#7A828F}
+
+  .head{flex:none;display:flex;align-items:center;gap:10px;padding:18px 20px 0}
+  .mark{width:26px;height:26px;border-radius:8px;background:linear-gradient(160deg,#4F8DF7,#2563EB);
+        display:grid;place-items:center;box-shadow:0 2px 8px -2px rgba(37,99,235,.7)}
+  .nm{font-size:13.5px;font-weight:600;letter-spacing:.2px}
+  .head .sp{flex:1}
+  .ghost{font-size:12px;color:#8B93A1;padding:5px 9px;border-radius:7px;background:#171B22;border:1px solid #232833}
+
+  .hero{flex:none;margin:16px 20px 0;border-radius:16px;padding:18px 20px 20px;
+        background:radial-gradient(120% 140% at 100% 0%,#1B2740 0%,#151A24 55%,#141821 100%);
+        border:1px solid #232B3A}
+  .hrow{display:flex;align-items:center}
+  .st{display:inline-flex;align-items:center;gap:8px;height:26px;padding:0 11px 0 10px;border-radius:13px;
+      background:rgba(34,197,94,.13);border:1px solid rgba(34,197,94,.28);font-size:12px;font-weight:600;color:#4ADE80}
+  .st i{width:6px;height:6px;border-radius:50%;background:#22C55E;box-shadow:0 0 8px 1px rgba(34,197,94,.9)}
+  .lat{margin-left:auto;display:flex;align-items:baseline;gap:5px}
+  .lat .n{font-size:26px;font-weight:650;letter-spacing:-1px;font-variant-numeric:tabular-nums;color:#F1F3F7}
+  .lat .u{font-size:11px;color:#7A828F;font-weight:500}
+  .hsub{margin-top:16px;display:flex;align-items:center;gap:10px;font-size:12px;color:#8B93A1}
+  .hsub b{color:#C9D0DB;font-weight:600;font-variant-numeric:tabular-nums}
+  .hsub .arw{color:#3E4757}
+  .bar{margin-top:16px;height:3px;border-radius:2px;background:#232A36;overflow:hidden;display:flex;gap:3px}
+  .bar i{height:3px;border-radius:2px;background:#2563EB;display:block}
+  .bar i.g{background:#22C55E}
+
+  .card{flex:none;margin:14px 20px 0;border-radius:16px;background:#151A22;border:1px solid #222834;
+        overflow:hidden}
+  .row{height:66px;display:flex;align-items:center;padding:0 16px;border-bottom:1px solid #1C222C}
+  .row:last-child{border-bottom:0}
+  .ib{width:28px;height:28px;border-radius:9px;display:grid;place-items:center;margin-right:11px;
+      background:#1C2432;color:#7DA8F5}
+  .rt{flex:1}
+  .rt .l{font-size:13px}
+  .rt .s{font-size:10.5px;color:#6D7684;margin-top:3px}
+  .seg{display:flex;background:#0F131A;border:1px solid #242B37;border-radius:9px;padding:3px;gap:2px}
+  .seg div{font-size:12px;color:#8B93A1;padding:5px 13px;border-radius:6px}
+  .seg .on{background:#24303F;color:#E6E8EC;font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.4)}
+  .seg .on.blue{background:#2563EB;color:#fff}
+  .field{display:flex;align-items:center;gap:6px;background:#0F131A;border:1px solid #242B37;
+         border-radius:9px;padding:6px 10px}
+  .field .v{font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;color:#E6E8EC;min-width:26px;text-align:right}
+  .field .u{font-size:11px;color:#6D7684}
+  .tg{width:42px;height:24px;border-radius:12px;background:#22C55E;position:relative}
+  .tg i{position:absolute;right:2px;top:2px;width:20px;height:20px;border-radius:50%;background:#fff;
+        box-shadow:0 1px 3px rgba(0,0,0,.45)}
+
+  .grow{flex:1}
+  .foot{flex:none;padding:0 20px 20px}
+  .primary{height:48px;border-radius:12px;display:grid;place-items:center;font-size:14.5px;font-weight:600;
+           background:linear-gradient(180deg,#3B82F6,#2563EB);color:#fff;letter-spacing:.3px;
+           box-shadow:0 1px 2px rgba(0,0,0,.4),0 10px 24px -10px rgba(37,99,235,.9)}
+  .sat{display:flex;justify-content:center;margin-top:10px}
+  .sat span{font-size:12.5px;color:#6D7684;padding:6px 12px}
+</style></head><body>
+
+<div class="tb">
+  <div class="cap">Com Bridge</div>
+  <div class="wb">︽</div><div class="wb">❐</div><div class="wb">✕</div>
+</div>
+
+<div class="head">
+  <div class="mark">
+    <svg width="15" height="15" viewBox="0 0 20 20" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round"><path d="M6.5 6.5H4.5M15.5 6.5h-2M6.5 13.5H4.5M15.5 13.5h-2M8 10h4"/></svg>
+  </div>
+  <div class="nm">Com Bridge</div>
+  <div class="sp"></div>
+  <div class="ghost">状态</div>
+  <div class="ghost">日志</div>
+</div>
+
+<div class="hero">
+  <div class="hrow">
+    <div class="st"><i></i>运行中</div>
+    <div class="lat"><div class="n">61</div><div class="u">ms</div></div>
+  </div>
+  <div class="hsub"><b>192.168.10.12</b><span class="arw">→</span><b>192.168.10.201</b><span>·</span><span>键盘鼠标 · 音频</span></div>
+  <div class="bar"><i class="g" style="width:32%"></i><i class="g" style="width:26%"></i><i style="width:18%"></i></div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <div class="ib"><svg width="15" height="15" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="2.5" y="4" width="15" height="10" rx="1.6"/><path d="M7 16.5h6"/></svg></div>
+    <div class="rt"><div class="l">这台电脑的角色</div><div class="s">主电脑接键盘鼠标与音箱</div></div>
+    <div class="seg"><div class="on blue">主电脑</div><div>副电脑</div></div>
+  </div>
+  <div class="row">
+    <div class="ib"><svg width="15" height="15" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3 6h9M3 10h14M3 14h7"/></svg></div>
+    <div class="rt"><div class="l">副电脑方位</div><div class="s">在屏幕右侧越过边界</div></div>
+    <div class="seg"><div>左</div><div class="on">右</div><div>上</div><div>下</div></div>
+  </div>
+  <div class="row">
+    <div class="ib"><svg width="15" height="15" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M10 3v14M6 7l4-4 4 4M6 13l4 4 4-4"/></svg></div>
+    <div class="rt"><div class="l">延迟目标</div><div class="s">音频抖动缓冲，越大越稳</div></div>
+    <div class="field"><div class="v">60</div><div class="u">ms</div></div>
+  </div>
+  <div class="row">
+    <div class="ib"><svg width="15" height="15" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M10 2.5a7.5 7.5 0 1 0 0 15 7.5 7.5 0 0 0 0-15z"/><path d="M10 6v4.2l2.6 1.6"/></svg></div>
+    <div class="rt"><div class="l">开机自启</div><div class="s">登录后静默启动到托盘</div></div>
+    <div class="tg"><i></i></div>
+  </div>
+</div>
+
+<div class="grow"></div>
+
+<div class="foot">
+  <div class="primary">启动服务</div>
+  <div class="sat"><span>停止服务</span></div>
+</div>
+
+</body></html>

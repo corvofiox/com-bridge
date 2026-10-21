@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<style>
+  html,body{margin:0;padding:0}
+  *{box-sizing:border-box;-webkit-font-smoothing:antialiased}
+  body{font-family:"Segoe UI Variable Display","Segoe UI","Microsoft YaHei UI",system-ui,sans-serif;
+       width:620px;height:690px;display:flex;flex-direction:column;overflow:hidden;
+       background:linear-gradient(165deg,#E9F0FF 0%,#F4F6FC 34%,#FBFCFF 70%,#FFFFFF 100%);
+       color:#101828}
+  .tb{height:30px;flex:none;display:flex;align-items:center;gap:8px;padding:0 12px 0 10px;
+      background:rgba(255,255,255,.66);border-bottom:1px solid rgba(16,24,40,.06);font-size:12px;color:#4A5468}
+  .tb .cap{flex:1}
+  .wb{width:30px;height:22px;display:grid;place-items:center;font-size:11px;color:#5B6478}
+
+  .head{flex:none;display:flex;align-items:center;gap:10px;padding:18px 20px 0}
+  .mark{width:28px;height:28px;border-radius:9px;background:linear-gradient(160deg,#6366F1,#4338CA);
+        display:grid;place-items:center;box-shadow:0 3px 10px -2px rgba(67,56,202,.45)}
+  .nm{font-size:14px;font-weight:650;letter-spacing:-.1px}
+  .head .sp{flex:1}
+  .ghost{font-size:12px;color:#5B6478;padding:5px 9px;border-radius:8px;background:rgba(255,255,255,.8);
+         border:1px solid rgba(16,24,40,.07);box-shadow:0 1px 2px rgba(16,24,40,.04)}
+
+  .hero{flex:none;margin:16px 20px 0;border-radius:18px;padding:18px 20px 18px;background:#fff;
+        box-shadow:0 1px 2px rgba(16,24,40,.05),0 10px 28px -12px rgba(16,24,40,.18)}
+  .hrow{display:flex;align-items:flex-start}
+  .st{display:inline-flex;align-items:center;gap:8px;height:26px;padding:0 11px 0 10px;border-radius:13px;
+      background:#E9FBF1;font-size:12px;font-weight:650;color:#0B7A4B}
+  .st i{width:7px;height:7px;border-radius:50%;background:#12B76A;box-shadow:0 0 0 3px rgba(18,183,106,.16)}
+  .lat{margin-left:auto;text-align:right}
+  .lat .n{font-size:27px;font-weight:700;letter-spacing:-1.2px;font-variant-numeric:tabular-nums;line-height:1}
+  .lat .u{font-size:10.5px;color:#98A2B3;margin-top:3px;letter-spacing:.3px}
+  .hsub{margin-top:14px;font-size:12px;color:#667085}
+  .hsub b{color:#101828;font-weight:600;font-variant-numeric:tabular-nums}
+  .chips{margin-top:14px;display:flex;gap:6px}
+  .chips span{font-size:10.5px;color:#475467;background:#F2F4F7;border-radius:6px;padding:4px 8px}
+
+  .card{flex:none;margin:14px 20px 0;border-radius:18px;background:#fff;overflow:hidden;
+        box-shadow:0 1px 2px rgba(16,24,40,.05),0 10px 28px -12px rgba(16,24,40,.16)}
+  .row{height:70px;display:flex;align-items:center;padding:0 18px;border-bottom:1px solid #F2F4F7}
+  .row:last-child{border-bottom:0}
+  .ib{width:30px;height:30px;border-radius:10px;display:grid;place-items:center;margin-right:12px}
+  .ib.b{background:#EEF2FF;color:#4F46E5}
+  .ib.g{background:#ECFDF5;color:#059669}
+  .ib.o{background:#FFF4ED;color:#EA580C}
+  .ib.p{background:#F5F3FF;color:#7C3AED}
+  .rt{flex:1}
+  .rt .l{font-size:13px;font-weight:550}
+  .rt .s{font-size:10.5px;color:#98A2B3;margin-top:3px}
+  .seg{display:flex;background:#F2F4F7;border-radius:10px;padding:3px;gap:2px}
+  .seg div{font-size:12px;color:#667085;padding:6px 13px;border-radius:7px}
+  .seg .on{background:#fff;color:#101828;font-weight:650;
+           box-shadow:0 1px 2px rgba(16,24,40,.12),0 0 0 1px rgba(16,24,40,.04)}
+  .field{display:flex;align-items:center;gap:5px;background:#F2F4F7;border-radius:9px;padding:7px 11px}
+  .field .v{font-size:13.5px;font-weight:650;font-variant-numeric:tabular-nums;min-width:24px;text-align:right}
+  .field .u{font-size:11px;color:#98A2B3}
+  .tg{width:44px;height:25px;border-radius:13px;background:#12B76A;position:relative}
+  .tg i{position:absolute;right:2px;top:2px;width:21px;height:21px;border-radius:50%;background:#fff;
+        box-shadow:0 1px 3px rgba(16,24,40,.28)}
+
+  .grow{flex:1}
+  .foot{flex:none;padding:0 20px 20px}
+  .primary{height:50px;border-radius:14px;display:grid;place-items:center;font-size:15px;font-weight:650;
+           background:linear-gradient(180deg,#4F46E5,#4338CA);color:#fff;letter-spacing:.4px;
+           box-shadow:0 1px 2px rgba(67,56,202,.28),0 12px 26px -10px rgba(67,56,202,.7)}
+  .sat{display:flex;justify-content:center;margin-top:10px}
+  .sat span{font-size:12.5px;color:#667085;padding:6px 12px}
+</style></head><body>
+
+<div class="tb">
+  <div class="cap">Com Bridge</div>
+  <div class="wb">︽</div><div class="wb">❐</div><div class="wb">✕</div>
+</div>
+
+<div class="head">
+  <div class="mark">
+    <svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round"><path d="M6.5 6.5H4.5M15.5 6.5h-2M6.5 13.5H4.5M15.5 13.5h-2M8 10h4"/></svg>
+  </div>
+  <div class="nm">Com Bridge</div>
+  <div class="sp"></div>
+  <div class="ghost">状态</div>
+  <div class="ghost">日志</div>
+</div>
+
+<div class="hero">
+  <div class="hrow">
+    <div class="st"><i></i>运行中</div>
+    <div class="lat"><div class="n">61<span style="font-size:12px;font-weight:600;color:#98A2B3;letter-spacing:0;margin-left:3px">ms</span></div><div class="u">端到端延迟</div></div>
+  </div>
+  <div class="hsub"><b>192.168.10.12</b> → <b>192.168.10.201</b></div>
+  <div class="chips"><span>键盘</span><span>鼠标</span><span>音频</span><span>剪贴板</span></div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <div class="ib b"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="2.5" y="4" width="15" height="10" rx="1.6"/><path d="M7 16.5h6"/></svg></div>
+    <div class="rt"><div class="l">这台电脑的角色</div><div class="s">主电脑接键盘鼠标与音箱</div></div>
+    <div class="seg"><div class="on">主电脑</div><div>副电脑</div></div>
+  </div>
+  <div class="row">
+    <div class="ib p"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3 6h9M3 10h14M3 14h7"/></svg></div>
+    <div class="rt"><div class="l">副电脑方位</div><div class="s">在屏幕右侧越过边界</div></div>
+    <div class="seg"><div>左</div><div class="on">右</div><div>上</div><div>下</div></div>
+  </div>
+  <div class="row">
+    <div class="ib o"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M10 3v14M6 7l4-4 4 4M6 13l4 4 4-4"/></svg></div>
+    <div class="rt"><div class="l">延迟目标</div><div class="s">音频抖动缓冲，越大越稳</div></div>
+    <div class="field"><div class="v">60</div><div class="u">ms</div></div>
+  </div>
+  <div class="row">
+    <div class="ib g"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M10 2.5a7.5 7.5 0 1 0 0 15 7.5 7.5 0 0 0 0-15z"/><path d="M10 6v4.2l2.6 1.6"/></svg></div>
+    <div class="rt"><div class="l">开机自启</div><div class="s">登录后静默启动到托盘</div></div>
+    <div class="tg"><i></i></div>
+  </div>
+</div>
+
+<div class="grow"></div>
+
+<div class="foot">
+  <div class="primary">启动服务</div>
+  <div class="sat"><span>停止服务</span></div>
+</div>
+
+</body></html>

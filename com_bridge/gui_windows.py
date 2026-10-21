@@ -2,18 +2,18 @@
 """次级窗口: 实时状态 / 日志。
 
 ## 为什么从主界面移出来(用户要求)
-"UI 实时状态和日志从主 UI 上移除, 归入次级窗口。通过按钮打开后
- 弹出窗口显示实时状态或日志。"
+"UI 实时状态和日志从主 UI 上移除, 归入次级窗口。通过按钮打开后弹出窗口
+显示实时状态或日志。" 主界面的职责只有两件: 告诉我现在的状态、让我启动
+或停止。把五行实时数据和一大块日志塞进主界面, 核心操作会被淹没。
 
-主界面的职责应该只有一件事: **告诉我现在是什么状态、让我启动/停止**。
-把五行实时数据和一大块日志塞在主界面里, 会让核心操作(启动/停止)
-被淹没 —— 那正是"毛坯感"的主要来源。
+## v6 重做(2026-10-21)
+早先这两个窗口是"逐行 Label + 系统 ttk 按钮", 与主界面 v6 的卡片语言
+完全脱节 —— 用户直接指出"次级菜单不仅没变化"。现在统一到主界面的
+一套原语: 圆角卡片 / 图标徽章 / 分段与胶囊控件 / 细线分隔。
 
-## 设计
-* 两个独立 Toplevel: 状态窗 / 日志窗, 可同时打开, 各自可最小化
-* 状态窗用"指标行 + 状态圆点"的排布, 比纯文本行更易扫读
-* 日志窗保留深色背景(等宽字体), 支持自动滚动与"暂停跟随"
-* 窗口关闭只是隐藏(不销毁), 下次打开保持原位置与内容
+★ 两个窗口都**按打开时的主题**构建。主窗口切换主题时会先把它们销毁
+  (见 gui._rebuild_ui), 下次打开就是新配色 —— 不做"运行时重着色",
+  因为 tkinter 里逐控件改色反而是最容易漏掉一半的地方。
 """
 from __future__ import annotations
 
@@ -39,7 +39,11 @@ class _BaseWindow:
     # -- 生命周期 ------------------------------------------------------
 
     def show(self) -> None:
-        if self.win is not None and self.win.winfo_exists():
+        try:
+            alive = self.win is not None and bool(self.win.winfo_exists())
+        except tk.TclError:
+            alive = False
+        if alive:
             self.win.deiconify()
             self.win.lift()
             try:
@@ -48,10 +52,8 @@ class _BaseWindow:
                 pass
             # ★★★ 重开窗口必须重启刷新定时器(用户实测 BUG:
             #   "实时状态在运行一段时间后会卡死不再更新")。
-            #   hide() 会取消 tick 链(hide_children), 而 show() 原来
-            #   只做 deiconify —— 定时器一旦取消就永远没人再排,
-            #   窗口重开后界面冻结在旧值。子类实现 on_reopen()
-            #   以恢复自己的循环; 无循环的子类不实现即可。
+            #   hide() 会取消 tick 链, 而 show() 原来只做 deiconify ——
+            #   定时器一旦取消就永远没人再排, 窗口重开后冻结在旧值。
             self.on_reopen()
             return
         self._create()
@@ -68,7 +70,6 @@ class _BaseWindow:
         w.protocol("WM_DELETE_WINDOW", self.hide)
         self.win = w
         self.build(w)
-        # 记住窗口位置, 下次打开还原
         w.bind("<Configure>", self._remember_pos)
 
     def _remember_pos(self, _ev=None) -> None:
@@ -87,15 +88,18 @@ class _BaseWindow:
         """子类可覆盖: 关闭时停掉自己的定时器。"""
 
     def destroy(self) -> None:
-        if self.win is not None and self.win.winfo_exists():
-            self.hide_children()
-            self.win.destroy()
+        try:
+            if self.win is not None and self.win.winfo_exists():
+                self.hide_children()
+                self.win.destroy()
+        except tk.TclError:
+            pass
         self.win = None
 
     @property
     def visible(self) -> bool:
         try:
-            return (self.win is not None and self.win.winfo_exists()
+            return (self.win is not None and bool(self.win.winfo_exists())
                     and self.win.state() != "withdrawn")
         except tk.TclError:
             return False
@@ -105,20 +109,22 @@ class _BaseWindow:
 
 
 class StatusWindow(_BaseWindow):
-    """实时状态窗口: 一行一个指标, 带状态圆点。"""
+    """实时状态窗口: 分组卡片 + 一行一个指标(圆点 + 名称 + 数值)。"""
 
     title = "Com Bridge · 实时状态"
-    geometry = "680x460"
+    geometry = "720x560"
 
     # (key, 分组标题, 显示名)
     FIELDS = (
         ("connection", "连接", "连接"),
         ("audio", "音频链路", "音频"),
-        ("buffer", "音频链路", "缓冲/延迟"),
+        ("buffer", "音频链路", "缓冲 / 延迟"),
         ("input", "输入链路", "键鼠"),
         ("clock", "输入链路", "时钟"),
         ("hook", "输入链路", "键盘钩子"),
     )
+
+    _LEVEL_COLOR = {0: "#98A2B3", 1: "#12B76A", 2: "#F59E0B", 3: "#E5484D"}
 
     def __init__(self, master: tk.Misc, app) -> None:
         super().__init__(master, app)
@@ -127,48 +133,76 @@ class StatusWindow(_BaseWindow):
         self._timer: str | None = None
 
     def build(self, w: tk.Toplevel) -> None:
-        outer = tk.Frame(w, background=T.BG, padx=T.PAD_L, pady=T.PAD_L)
-        outer.pack(fill="both", expand=True)
+        page = tk.Frame(w, background=T.BG, padx=T.PAGE_PAD, pady=16)
+        page.pack(fill="both", expand=True)
 
-        # 顶栏: 标题 + 刷新提示
-        top = tk.Frame(outer, background=T.BG)
-        top.pack(fill="x", pady=(0, T.PAD_M))
-        tk.Label(top, text="实时状态", background=T.BG, foreground=T.TEXT,
-                 font=T.FONT_TITLE).pack(side="left")
-        self._updated = tk.Label(top, text="", background=T.BG,
+        # ── 标题栏 ─────────────────────────────────────────────────
+        top = tk.Frame(page, background=T.BG)
+        top.pack(fill="x", pady=(0, 14))
+        title_box = tk.Frame(top, background=T.BG)
+        title_box.pack(side="left")
+        tk.Label(title_box, text="实时状态", background=T.BG,
+                 foreground=T.TEXT, font=T.FONT_TITLE,
+                 padx=0).pack(anchor="w")
+        self._updated = tk.Label(title_box, text="正在读取…", background=T.BG,
                                  foreground=T.TEXT_FAINT,
-                                 font=T.FONT_UI_TINY)
-        self._updated.pack(side="right")
+                                 font=T.FONT_UI_SMALL, padx=0)
+        self._updated.pack(anchor="w", pady=(2, 0))
+        T.PillButton(top, "关闭", self.hide, bg=T.BG).pack(side="right")
 
-        # 卡片: 按分组排布
+        # ── 分组卡片 ───────────────────────────────────────────────
         current_group = None
-        group_inner = None
+        group_body = None
+        first_in_group = False
         for key, group, label in self.FIELDS:
             if group != current_group:
                 current_group = group
-                card, group_inner = T.card(outer, title=group)
-                card.pack(fill="x", pady=(0, T.PAD_S))
-            row = tk.Frame(group_inner, background=T.CARD)
-            row.pack(fill="x", pady=2)
-            dot = tk.Label(row, text="●", background=T.CARD,
-                           foreground=T.TEXT_FAINT,
-                           font=("Segoe UI Symbol", 11))
-            dot.pack(side="left", padx=(0, T.PAD_S))
-            tk.Label(row, text=label, background=T.CARD,
+                first_in_group = True
+                wrap = tk.Frame(page, background=T.BG)
+                wrap.pack(fill="x", pady=(0, 6))
+                card = T.Card(wrap, bg=T.BG)
+                card.pack(fill="x")
+                group_body = card.body
+                head = tk.Frame(group_body, background=T.CARD)
+                head.pack(fill="x", padx=T.CARD_PAD_X, pady=(12, 6))
+                tk.Label(head, text=group, background=T.CARD,
+                         foreground=T.TEXT_FAINT, font=T.FONT_UI_SMALL,
+                         padx=0).pack(side="left")
+            row = tk.Frame(group_body, background=T.CARD, height=38)
+            row.pack(fill="x")
+            row.pack_propagate(False)
+            if not first_in_group:
+                tk.Frame(row, background=T.HAIR, height=1,
+                         bd=0).pack(fill="x")
+            first_in_group = False
+            holder = tk.Frame(row, background=T.CARD)
+            holder.pack(fill="both", expand=True, padx=T.CARD_PAD_X)
+
+            dot = T.status_dot(holder, color=T.TEXT_FAINT, size=7,
+                               glow=False)
+            dot.pack(side="left", padx=(0, 10))
+            # ★ 固定宽度的名称列: 用 Frame + pack_propagate(False) 撑出
+            #   像素级宽度, 中文用 Label 的 width(字符数) 不可靠。
+            name_box = tk.Frame(holder, background=T.CARD, width=96,
+                                height=18)
+            name_box.pack(side="left")
+            name_box.pack_propagate(False)
+            tk.Label(name_box, text=label, background=T.CARD,
                      foreground=T.TEXT_MUTED, font=T.FONT_UI_SMALL,
-                     width=10, anchor="w").pack(side="left")
-            val = tk.Label(row, text="-", background=T.CARD,
+                     anchor="w", padx=0).pack(fill="both", expand=True)
+            val = tk.Label(holder, text="—", background=T.CARD,
                            foreground=T.TEXT, font=T.FONT_UI_SMALL,
-                           anchor="w", justify="left")
+                           anchor="w", justify="left", padx=0)
             val.pack(side="left", fill="x", expand=True)
             self._rows[key] = val
             self._dots[key] = dot
 
-        # 底部按钮
-        btns = tk.Frame(outer, background=T.BG)
-        btns.pack(fill="x", pady=(T.PAD_S, 0))
-        ttk.Button(btns, text="关闭", style="Secondary.TButton",
-                   command=self.hide).pack(side="right")
+        # ── 底部说明 ───────────────────────────────────────────────
+        foot = tk.Frame(page, background=T.BG)
+        foot.pack(fill="x", pady=(6, 0))
+        tk.Label(foot, text="绿色=正常 · 琥珀=需注意 · 红色=异常",
+                 background=T.BG, foreground=T.TEXT_FAINT,
+                 font=T.FONT_UI_TINY, padx=0).pack(side="left")
 
         self._tick()
 
@@ -179,7 +213,16 @@ class StatusWindow(_BaseWindow):
         try:
             self.refresh()
         except Exception:  # noqa: BLE001
-            pass
+            # ★ 这里**不能**静默吞: 曾经因为 set_color 签名不匹配抛
+            #   TypeError, 被这个 except 吃掉, 界面表现为"一行数据都没有"。
+            #   现在把异常写进日志区(用户能在日志窗口看到)。
+            import traceback
+            try:
+                self.app._log_q.put_nowait(
+                    "!! 状态窗口刷新失败: "
+                    + traceback.format_exc(limit=2).replace("\n", " | "))
+            except Exception:  # noqa: BLE001
+                pass
         try:
             self._timer = self.win.after(500, self._tick)
         except tk.TclError:
@@ -194,7 +237,7 @@ class StatusWindow(_BaseWindow):
         self._timer = None
 
     def on_reopen(self) -> None:
-        """重开时重启刷新循环(BUG 修复: hide 取消后无人再排)。"""
+        """重开时重启刷新循环(hide 取消后无人再排)。"""
         if self._timer is None:
             self._tick()
 
@@ -203,29 +246,32 @@ class StatusWindow(_BaseWindow):
         data = self.app.collect_status()
         for key, _group, _label in self.FIELDS:
             item = data.get(key)
+            lbl = self._rows.get(key)
+            dot = self._dots.get(key)
             if item is None:
+                if lbl is not None:
+                    lbl.configure(text="—", foreground=T.TEXT_FAINT)
+                if dot is not None and hasattr(dot, "set_color"):
+                    dot.set_color("#C6CFDA", glow=False)
                 continue
             text, level = item if isinstance(item, tuple) else (str(item), 0)
-            lbl = self._rows.get(key)
             if lbl is not None:
                 lbl.configure(text=text)
-            dot = self._dots.get(key)
-            if dot is not None:
-                color = {0: T.TEXT_FAINT, 1: T.SUCCESS,
-                         2: T.WARNING, 3: T.DANGER}.get(level, T.TEXT_FAINT)
-                dot.configure(foreground=color)
+            if dot is not None and hasattr(dot, "set_color"):
+                dot.set_color(self._LEVEL_COLOR.get(level, "#98A2B3"),
+                              glow=(level in (1, 2, 3)))
         try:
             self._updated.configure(
-                text="更新于 " + time.strftime("%H:%M:%S"))
+                text="更新于 " + time.strftime("%H:%M:%S") + " · 每 0.5 秒刷新")
         except tk.TclError:
             pass
 
 
 class LogWindow(_BaseWindow):
-    """日志窗口: 深色等宽 + 自动跟随。"""
+    """日志窗口: 等宽字体 + 级别着色 + 自动跟随。"""
 
     title = "Com Bridge · 日志"
-    geometry = "820x520"
+    geometry = "880x600"
 
     def __init__(self, master: tk.Misc, app) -> None:
         super().__init__(master, app)
@@ -235,37 +281,57 @@ class LogWindow(_BaseWindow):
         self._pending: list[str] = []
 
     def build(self, w: tk.Toplevel) -> None:
-        outer = tk.Frame(w, background=T.BG, padx=T.PAD_L, pady=T.PAD_L)
-        outer.pack(fill="both", expand=True)
+        page = tk.Frame(w, background=T.BG, padx=T.PAGE_PAD, pady=16)
+        page.pack(fill="both", expand=True)
 
-        top = tk.Frame(outer, background=T.BG)
-        top.pack(fill="x", pady=(0, T.PAD_S))
-        tk.Label(top, text="运行日志", background=T.BG, foreground=T.TEXT,
-                 font=T.FONT_TITLE).pack(side="left")
-        ttk.Checkbutton(top, text="自动跟随", variable=self._follow,
-                        style="Card.TCheckbutton"
-                        if "Card.TCheckbutton" in
-                        ttk.Style(w).map("TCheckbutton")
-                        else "TCheckbutton").pack(side="right")
-        ttk.Button(top, text="清空", style="Secondary.TButton",
-                   command=self.clear).pack(side="right", padx=T.PAD_S)
+        # ── 标题栏 ─────────────────────────────────────────────────
+        top = tk.Frame(page, background=T.BG)
+        top.pack(fill="x", pady=(0, 12))
+        title_box = tk.Frame(top, background=T.BG)
+        title_box.pack(side="left")
+        tk.Label(title_box, text="运行日志", background=T.BG,
+                 foreground=T.TEXT, font=T.FONT_TITLE,
+                 padx=0).pack(anchor="w")
+        self._hint = tk.Label(title_box, text="", background=T.BG,
+                              foreground=T.TEXT_FAINT,
+                              font=T.FONT_UI_SMALL, padx=0)
+        self._hint.pack(anchor="w", pady=(2, 0))
 
-        frame = tk.Frame(outer, background=T.LOG_BG,
-                         highlightbackground=T.BORDER, highlightthickness=1)
-        frame.pack(fill="both", expand=True)
-        self._text = tk.Text(frame, wrap="none", state="disabled",
-                             font=T.FONT_MONO, background=T.LOG_BG,
-                             foreground=T.LOG_FG, insertbackground=T.LOG_FG,
-                             borderwidth=0, padx=10, pady=8)
-        sb = ttk.Scrollbar(frame, command=self._text.yview)
+        T.PillButton(top, "关闭", self.hide, bg=T.BG).pack(side="right")
+        T.PillButton(top, "清空", self.clear,
+                     bg=T.BG).pack(side="right", padx=(6, 0))
+        follow = tk.Frame(top, background=T.BG)
+        follow.pack(side="right", padx=(0, 10))
+        tk.Label(follow, text="自动跟随", background=T.BG,
+                 foreground=T.TEXT_MUTED, font=T.FONT_UI_SMALL).pack(
+            side="left", padx=(0, 8))
+        T.toggle(follow, on=True, width=38, height=22, bg=T.BG,
+                 command=lambda on: self._follow.set(bool(on))).pack(
+            side="left")
+
+        # ── 日志卡片 ───────────────────────────────────────────────
+        wrap = tk.Frame(page, background=T.BG)
+        wrap.pack(fill="both", expand=True)
+        card = T.Card(wrap, bg=T.BG)
+        card.pack(fill="both", expand=True)
+        inner = tk.Frame(card.body, background=T.CARD)
+        inner.pack(fill="both", expand=True, padx=12, pady=10)
+
+        self._text = tk.Text(
+            inner, wrap="none", state="disabled", font=T.FONT_MONO,
+            background=T.CARD, foreground=T.TEXT,
+            insertbackground=T.TEXT, borderwidth=0, highlightthickness=0,
+            padx=2, pady=2, selectbackground=T.PRIMARY_BG,
+            selectforeground=T.TEXT)
+        # ★ 按级别着色: 用 Text 的 tag, 这样一行出错不影响其它行
+        self._text.tag_configure("err", foreground=T.DANGER)
+        self._text.tag_configure("warn", foreground=T.WARNING)
+        self._text.tag_configure("ok", foreground=T.SUCCESS)
+        self._text.tag_configure("dim", foreground=T.TEXT_FAINT)
+        sb = ttk.Scrollbar(inner, command=self._text.yview)
         self._text.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self._text.pack(side="left", fill="both", expand=True)
-
-        btns = tk.Frame(outer, background=T.BG)
-        btns.pack(fill="x", pady=(T.PAD_S, 0))
-        ttk.Button(btns, text="关闭", style="Secondary.TButton",
-                   command=self.hide).pack(side="right")
 
         self._tick()
 
@@ -283,13 +349,23 @@ class LogWindow(_BaseWindow):
         self._insert(line)
 
     def _insert(self, line: str) -> None:
+        """插入一行日志并按内容着色。"""
         t = self._text
         if t is None:
             return
         try:
+            tag = None
+            if any(k in line for k in ("!!", "失败", "错误", "异常", "Error")):
+                tag = "err"
+            elif any(k in line for k in ("警告", "超时", "断口", "重连", "WARN")):
+                tag = "warn"
+            elif any(k in line for k in ("通过", "就绪", "完成", "已连接", "OK")):
+                tag = "ok"
             t.configure(state="normal")
-            t.insert("end", line + "\n")
-            # 限制总行数, 防内存无限增长
+            if tag:
+                t.insert("end", line + "\n", tag)
+            else:
+                t.insert("end", line + "\n")
             if int(t.index("end-1c").split(".")[0]) > 5000:
                 t.delete("1.0", "1000.0")
             if self._follow.get():
@@ -312,12 +388,18 @@ class LogWindow(_BaseWindow):
         if not self.visible:
             self._timer = None
             return
-        # 补上窗口关闭期间缓存的日志
         if self._pending:
             batch = self._pending
             self._pending = []
             for line in batch[-1500:]:
                 self._insert(line)
+        try:
+            n = 0
+            if self._text is not None:
+                n = int(self._text.index("end-1c").split(".")[0])
+            self._hint.configure(text=f"共 {n} 行 · 超过 5000 行自动丢弃最早部分")
+        except tk.TclError:
+            pass
         try:
             self._timer = self.win.after(300, self._tick)
         except tk.TclError:
@@ -332,6 +414,6 @@ class LogWindow(_BaseWindow):
         self._timer = None
 
     def on_reopen(self) -> None:
-        """重开时重启补日志循环(hide 取消后无人再排, 同 StatusWindow)。"""
+        """重开时重启补日志循环(hide 取消后无人再排)。"""
         if self._timer is None:
             self._tick()

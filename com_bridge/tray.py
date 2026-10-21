@@ -77,6 +77,7 @@ WM_TASKBARCREATED = 0  # 动态注册, 见 _taskbar_created_msg
 #   这是**同一个坑的第二次**: 先前是 GetCursorPos 的 POINT 类型冲突。
 #   结论: 任何 Windows 结构/函数签名, 全项目只允许有一份定义。
 from .input import WNDCLASSW, WNDPROC  # noqa: E402
+from . import brand           # noqa: E402
 
 
 class NOTIFYICONDATAW(ctypes.Structure):
@@ -134,6 +135,9 @@ gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
 CMD_SHOW = 1001
 CMD_START = 1002
 CMD_STOP = 1003
+# ★ 2026-10-21: 主界面顶栏的「日志」入口已按用户要求移除, 日志窗口改由
+#   托盘菜单打开 —— 功能不能因为少一个按钮就消失。
+CMD_LOG = 1004
 CMD_EXIT = 1099
 
 
@@ -150,6 +154,287 @@ def _tray_icon_size() -> int:
     except Exception:  # noqa: BLE001
         pass
     return 16
+
+
+# --- 图标几何(16px 基准) -------------------------------------------------
+#
+# 设计(用户 2026-10-21 二次定稿):
+#   主体 = 「H」: 两根竖直柱 + 中间一条短横杠
+#     (两柱 = 两台电脑, 横杠 = 连接链路)
+#   右下角圆点 = 状态: 绿=已连接 / 黄=已启动未连接 / 无点=未启动
+#   主体色随任务栏明暗反转(Win11 托盘图标就是这么做的)
+#
+# ★★★ 2026-10-21 用户第三次改造型: 三条横线 -> 「H」。
+#   用户原话: "当前托盘图标是三条横线, 直接改成H, 黄绿点状态保持不变"。
+#   几何集中在 com_bridge/brand.py(tray_rects), 与窗口图标/exe 图标
+#   共用同一份定义 —— 早先四处各画一套, 改一次要改四处且会逐渐漂移。
+#
+# ★ 为什么在代码里用 GDI 画, 而不是读 .ico/.png:
+#   单文件 exe 解包后资源路径会变(见 _make_dot_icon 的历史注释),
+#   纯代码画零路径依赖; 而且状态色需要运行时切换。
+#
+# 圆点: 右下角, 叠在右柱下端外侧
+# ★ 2026-10-21 修正: 原来半径 2.25px、且带一圈"透明挖空环"。用户实测反馈
+#   两个缺陷: ①绿点不圆(16px 直绘无抗锯齿, 4px 的圆只能是方块);
+#   ②绿点上方有白块(挖空环把第三条横线切了个缺口)。
+#   挖空环当初是为"黑点压在黑线上"准备的; 现在只有绿/黄两色, 与黑线天然
+#   高对比, **完全不需要挖空** —— 去掉它, 白块随之消失。
+#   圆度问题靠 8x 超采样解决(见 _render_rgba)。
+# 圆点中心落在 12.8(而非 13.0): 半径 2.35 时右/下边缘到 15.15,
+# 仍在画布内且留 0.35px 余量, 不会被托盘裁切。
+# 中心取 .8 而不是 .0, 是为了让圆点跨越像素格的中心, 8x 采样下
+# 绿/黄两色的覆盖率更一致(实测中心在整数格上时黄点会小一圈)。
+DOT_CX, DOT_CY, DOT_R = 12.8, 12.8, 2.35
+# 采样倍数: 8x -> 16px 图标内部按 128x128 计算, 圆点边缘有真实的灰度过渡
+SS = 8
+
+# 状态 -> 圆点颜色(None = 不画点)
+STATE_DOT = {
+    "connected": (0x22, 0xC5, 0x5E),     # 绿
+    "waiting": (0xFB, 0xBF, 0x24),       # 黄
+    "off": None,                          # 未启动: 无点
+}
+# 主体色: 浅色任务栏纯黑, 深色任务栏纯白
+BODY_LIGHT = (0x00, 0x00, 0x00)
+BODY_DARK = (0xFF, 0xFF, 0xFF)
+
+
+def _taskbar_is_dark() -> bool:
+    """当前任务栏是否为深色主题(决定图标主体用黑还是白)。
+
+    ★ 读注册表 `SystemUsesLightTheme`:
+        1 = 浅色任务栏 -> 图标用黑色
+        0 = 深色任务栏 -> 图标用白色
+      读取失败时按浅色处理(Windows 默认)。
+    """
+    try:
+        import winreg
+        with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        ) as k:
+            val, _ = winreg.QueryValueEx(k, "SystemUsesLightTheme")
+            return int(val) == 0
+    except (OSError, ValueError, FileNotFoundError):
+        return False
+
+
+def _make_channel_icon(dot_color, size: int = 16,
+                       dark_taskbar: bool = False) -> int:
+    """画托盘图标: 三条横线 + 右下角圆点。返回 HICON(失败 0)。
+
+    逐像素写 32bpp DIB + AND 掩码(与 _make_dot_icon 同一套已验证的路径),
+    区别只是"画什么": 圆 -> 三条横线 + 圆点。
+
+    ★ 两个必须注意的点(踩过的坑, 见 _make_dot_icon 注释):
+      1. restype 必须在调用之前声明, 否则 64 位句柄被截断 -> 图标空白
+      2. 透明必须由 AND 掩码决定(1=透明), 只靠 alpha 不可靠
+    """
+    hdc_screen = 0
+    hdc = 0
+    hbm = 0
+    hbm_mask = 0
+    hicon = 0
+    try:
+        gdi32.CreateDIBSection.restype = wintypes.HBITMAP
+        gdi32.CreateDIBSection.argtypes = [
+            wintypes.HDC, ctypes.c_void_p, wintypes.UINT,
+            ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.DWORD]
+        gdi32.CreateBitmap.restype = wintypes.HBITMAP
+        gdi32.CreateBitmap.argtypes = [
+            ctypes.c_int, ctypes.c_int, wintypes.UINT, wintypes.UINT,
+            ctypes.c_void_p]
+        gdi32.SelectObject.restype = wintypes.HGDIOBJ
+        gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+        gdi32.DeleteObject.restype = wintypes.BOOL
+        gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+        gdi32.DeleteDC.restype = wintypes.BOOL
+        gdi32.DeleteDC.argtypes = [wintypes.HDC]
+        gdi32.CreateCompatibleDC.restype = wintypes.HDC
+        gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+        user32.GetDC.restype = wintypes.HDC
+        user32.GetDC.argtypes = [wintypes.HWND]
+        user32.ReleaseDC.restype = ctypes.c_int
+        user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+        user32.CreateIconIndirect.restype = wintypes.HICON
+        user32.CreateIconIndirect.argtypes = [ctypes.c_void_p]
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [
+                ("biSize", wintypes.DWORD), ("biWidth", ctypes.c_long),
+                ("biHeight", ctypes.c_long), ("biPlanes", wintypes.WORD),
+                ("biBitCount", wintypes.WORD),
+                ("biCompression", wintypes.DWORD),
+                ("biSizeImage", wintypes.DWORD),
+                ("biXPelsPerMeter", ctypes.c_long),
+                ("biYPelsPerMeter", ctypes.c_long),
+                ("biClrUsed", wintypes.DWORD),
+                ("biClrImportant", wintypes.DWORD),
+            ]
+
+        class BITMAPINFO(ctypes.Structure):
+            _fields_ = [("bmiHeader", BITMAPINFOHEADER),
+                        ("bmiColors", wintypes.DWORD * 3)]
+
+        class ICONINFO(ctypes.Structure):
+            _fields_ = [("fIcon", wintypes.BOOL),
+                        ("xHotspot", wintypes.DWORD),
+                        ("yHotspot", wintypes.DWORD),
+                        ("hbmMask", wintypes.HBITMAP),
+                        ("hbmColor", wintypes.HBITMAP)]
+
+        hdc_screen = user32.GetDC(None)
+        if not hdc_screen:
+            return 0
+        hdc = gdi32.CreateCompatibleDC(hdc_screen)
+        if not hdc:
+            return 0
+
+        bi = BITMAPINFO()
+        bi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bi.bmiHeader.biWidth = size
+        bi.bmiHeader.biHeight = size
+        bi.bmiHeader.biPlanes = 1
+        bi.bmiHeader.biBitCount = 32
+        bi.bmiHeader.biCompression = 0
+
+        bits = ctypes.c_void_p()
+        hbm = gdi32.CreateDIBSection(hdc, ctypes.byref(bi), 0,
+                                     ctypes.byref(bits), None, 0)
+        if not hbm or not bits.value:
+            return 0
+        gdi32.SelectObject(hdc, hbm)
+
+        body = BODY_DARK if dark_taskbar else BODY_LIGHT
+        br, bg, bb = body
+
+        total = size * size
+        color_px = (ctypes.c_ubyte * (total * 4)).from_address(bits.value)
+        mask_stride = ((size + 31) // 32) * 4
+        mask_buf = (ctypes.c_ubyte * (mask_stride * size))()
+        for i in range(mask_stride * size):
+            mask_buf[i] = 0xFF              # 默认全透明
+
+        k = size / 16.0                     # 16px 基准 -> 实际尺寸
+
+        # ★★★ 超采样抗锯齿(2026-10-21 用户反馈修正)
+        #   原实现直接在 size×size 上逐像素判定"是否在圆内", 结果 16px 下
+        #   直径 ~4.5px 的圆点只能落成**方块**(用户: "绿点也不圆")。
+        #   现在按 SS 倍超采样累积覆盖率, 再缩回目标尺寸:
+        #     cov[y][x] = 覆盖该像素的子样本数 / SS²
+        #   颜色按覆盖率与背景混合 -> 边缘有真实的灰度过渡, 圆就圆了。
+        #
+        # ★★★ 2026-10-21 造型改为「H」(用户: "直接改成H"):
+        #   形状来自 brand.tray_rects(), 与窗口图标 / exe 图标同一份定义。
+        #   三个矩形(左柱/右柱/横杠)是同一颜色的实体, 覆盖率取并集。
+        SS_LOCAL = SS if size <= 32 else 4   # 大尺寸不需要 8x(省时间)
+        cov_body = [[0] * size for _ in range(size)]
+        cov_dot = [[0] * size for _ in range(size)]
+        n_sub = SS_LOCAL * SS_LOCAL
+        rects = brand.tray_rects(16.0)
+
+        for sy in range(size * SS_LOCAL):
+            fy = (sy + 0.5) / SS_LOCAL      # 子样本在图标坐标里的位置
+            ty = fy / k                     # 换算到 16px 基准
+            yb = int(fy)
+            if yb >= size:
+                continue
+            row_b = cov_body[yb]
+            row_d = cov_dot[yb]
+            for sx in range(size * SS_LOCAL):
+                fx = (sx + 0.5) / SS_LOCAL
+                tx = fx / k
+                # --- H 的三个矩形 ---
+                inside = False
+                for (x0, y0, x1, y1) in rects:
+                    if x0 <= tx < x1 and y0 <= ty < y1:
+                        inside = True
+                        break
+                if inside:
+                    row_b[int(fx)] += 1
+                # --- 圆点(画在 H 之上, 覆盖式) ---
+                if dot_color is not None:
+                    dx = tx - DOT_CX
+                    dy = ty - DOT_CY
+                    if dx * dx + dy * dy <= DOT_R * DOT_R:
+                        row_d[int(fx)] += 1
+
+        def put_rgba(px: int, py: int, rgb, alpha: int) -> None:
+            """写一个带 alpha 的像素(alpha 只用于"是否完全透明"的掩码)。"""
+            if not (0 <= px < size and 0 <= py < size) or alpha <= 0:
+                return
+            row = size - 1 - py
+            i = (row * size + px) * 4
+            r_, g_, b_ = rgb
+            color_px[i] = b_
+            color_px[i + 1] = g_
+            color_px[i + 2] = r_
+            color_px[i + 3] = alpha
+            byte_i = row * mask_stride + (px // 8)
+            if alpha >= 128:
+                mask_buf[byte_i] &= ~(0x80 >> (px % 8)) & 0xFF
+            else:
+                mask_buf[byte_i] |= (0x80 >> (px % 8)) & 0xFF
+
+        for py in range(size):
+            for px in range(size):
+                cd = cov_dot[py][px] / n_sub      # 圆点覆盖率 0..1
+                cb = cov_body[py][px] / n_sub     # 横线覆盖率 0..1
+                if cd <= 0 and cb <= 0:
+                    continue
+                # ★★★ 正确的 over 合成(2026-10-21 用户反馈修正)
+                #   圆点画在横线**之上**。旧实现只按圆点覆盖率写颜色:
+                #     cd=0.3 -> 30% 绿 + 70% **透明** -> 露出任务栏白底
+                #   这正是用户看到的"绿点上方有一块白"。
+                #   正确公式(dot over body):
+                #     out_a = cd + cb*(1-cd)
+                #     out_c = (dot*cd + body*cb*(1-cd)) / out_a
+                #   于是"圆点边缘压在横线上"得到的是**不透明的深绿**,
+                #   而不是半透明绿 + 白色。
+                out_a = cd + cb * (1.0 - cd)
+                if out_a <= 0:
+                    continue
+                dr, dg, db = dot_color if dot_color is not None else body
+                mix = []
+                for i in range(3):
+                    v = (dr, dg, db)[i] * cd + (br, bg, bb)[i] * cb * (1.0 - cd)
+                    mix.append(int(round(v / out_a)))
+                put_rgba(px, py, tuple(mix), int(round(255 * out_a)))
+        hbm_mask = gdi32.CreateBitmap(size, size, 1, 1, mask_buf)
+        if not hbm_mask:
+            return 0
+
+        ii = ICONINFO()
+        ii.fIcon = 1
+        ii.xHotspot = 0
+        ii.yHotspot = 0
+        ii.hbmMask = hbm_mask
+        ii.hbmColor = hbm
+        hicon = user32.CreateIconIndirect(ctypes.byref(ii))
+        return int(hicon or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+    finally:
+        try:
+            if hbm_mask:
+                gdi32.DeleteObject(hbm_mask)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if hbm:
+                gdi32.DeleteObject(hbm)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if hdc:
+                gdi32.DeleteDC(hdc)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if hdc_screen:
+                user32.ReleaseDC(None, hdc_screen)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _make_dot_icon(color: tuple[int, int, int],
@@ -323,25 +608,28 @@ def _make_dot_icon(color: tuple[int, int, int],
 class TrayIcon:
     """托盘图标宿主: 独立线程 + 隐藏窗口 + 右键菜单。
 
-    on_show()  / on_start() / on_stop() / on_exit() 由调用方提供,
+    on_show() / on_log() / on_start() / on_stop() / on_exit() 由调用方提供,
     它们会在**托盘线程**里被调用 —— 调用方必须自己切回 UI 线程
     (tkinter 里用 root.after(0, ...))。
     """
 
     def __init__(self, tooltip: str = "Com Bridge",
                  on_show=None, on_start=None, on_stop=None, on_exit=None,
-                 ico_path: str | None = None):
+                 on_log=None, ico_path: str | None = None):
         self.tooltip = tooltip
         self._on_show = on_show
         self._on_start = on_start
         self._on_stop = on_stop
         self._on_exit = on_exit
+        self._on_log = on_log
         self._ico_path = ico_path
         self._hwnd = 0
         self._hicon = 0
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self.running = False
+        # 三态: connected / waiting / off(见 set_status)
+        self.state = "off"
         # 图标是否真的进了托盘(见 _add_icon 的诊断记录)
         self.icon_ok = False
         self.icon_detail = "未初始化"
@@ -369,14 +657,31 @@ class TrayIcon:
             self._thread = None
         self.running = False
 
-    def set_status(self, running: bool, text: str | None = None) -> None:
-        """更新状态(图标颜色 + tooltip)。用户要求"直观分辨是否已启动"。"""
+    def set_status(self, running: bool, text: str | None = None,
+                   state: str | None = None) -> None:
+        """更新状态(图标圆点 + tooltip)。
+
+        ★ 三态(用户 2026-10-21 定稿):
+            connected  绿点  已连接
+            waiting    黄点  已启动但未连接(等待主电脑)
+            off        无点  未启动
+
+        参数:
+          running  兼容旧接口(True/False), 仅在 state 未给出时用于推断
+          text     tooltip 文本
+          state    上面三种之一; 省略时 running=True -> connected, False -> off
+        """
         self.running = running
+        if state is None:
+            state = "connected" if running else "off"
+        if state not in STATE_DOT:
+            state = "connected" if running else "off"
+        self.state = state
         if text:
             self.tooltip = text
         if self._hwnd:
             # 通过消息让托盘线程自己更新(避免跨线程操作 GDI 对象)
-            user32.PostMessageW(self._hwnd, WM_TRAYICON + 1, 
+            user32.PostMessageW(self._hwnd, WM_TRAYICON + 1,
                                 1 if running else 0, 0)
 
     # -- 内部 ----------------------------------------------------------
@@ -443,6 +748,18 @@ class TrayIcon:
             except Exception:  # noqa: BLE001
                 pass
         color = (46, 160, 67) if running else (140, 140, 140)
+        # ★ 三态图标: 三条横线 + 状态圆点(绿/黄/无点)
+        #   主体色随任务栏明暗反转(读 SystemUsesLightTheme)
+        try:
+            dark_bar = _taskbar_is_dark()
+            state = getattr(self, "state", "off")
+            h = _make_channel_icon(STATE_DOT.get(state), size=_tray_icon_size(),
+                                   dark_taskbar=dark_bar)
+            if h:
+                return h
+        except Exception:  # noqa: BLE001
+            pass
+        # 兜底: 旧圆点图标(仅在 channel 图标生成失败时)
         h = _make_dot_icon(color, size=_tray_icon_size())
         if h:
             return h
@@ -512,6 +829,7 @@ class TrayIcon:
             return
         try:
             user32.AppendMenuW(hmenu, MF_STRING, CMD_SHOW, "显示窗口")
+            user32.AppendMenuW(hmenu, MF_STRING, CMD_LOG, "查看日志")
             user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
             if self.running:
                 user32.AppendMenuW(hmenu, MF_STRING, CMD_STOP, "停止服务")
@@ -552,6 +870,8 @@ class TrayIcon:
                     self._on_start()
                 elif cmd == CMD_STOP and self._on_stop:
                     self._on_stop()
+                elif cmd == CMD_LOG and self._on_log:
+                    self._on_log()
                 elif cmd == CMD_EXIT and self._on_exit:
                     self._on_exit()
                 return 0

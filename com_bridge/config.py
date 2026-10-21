@@ -37,6 +37,8 @@ _DEFAULTS = {
     "was_running": False,
     # 上次退出时间(诊断用, 也让"多久没动过"可读)
     "last_exit": 0.0,
+    # 界面配色: auto(跟随 Windows) | light | dark
+    "ui_theme": "auto",
 }
 
 

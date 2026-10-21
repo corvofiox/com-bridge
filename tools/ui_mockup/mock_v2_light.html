@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Com Bridge — 视觉稿 v2（浅色）</title>
+<style>
+  :root{
+    --page:#EEF1F5;
+    --win:#FFFFFF;
+    --card:#FFFFFF;
+    --card2:#F7F9FC;
+    --line:#E3E8EF;
+    --line2:#D2DAE5;
+    --text:#111827;
+    --muted:#5B6775;
+    --faint:#8D98A6;
+    --accent:#2F6BE0;
+    --accent2:#4C8DFF;
+    --accentBg:#EDF3FF;
+    --ok:#16A34A;
+    --okBg:#E9F7EF;
+    --warn:#D97706;
+    --warnBg:#FEF6E7;
+    --mono:"Cascadia Mono",Consolas,"Courier New",monospace;
+    --ui:"Segoe UI Variable Display","Segoe UI","Microsoft YaHei UI",system-ui,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--page);color:var(--text);font-family:var(--ui);
+       padding:56px 52px 64px;-webkit-font-smoothing:antialiased}
+
+  header{display:flex;align-items:flex-end;justify-content:space-between;
+         padding-bottom:26px;border-bottom:1px solid #DFE4EC;margin-bottom:40px}
+  .brand{display:flex;align-items:center;gap:16px}
+  .mark{width:48px;height:48px;border-radius:13px;
+        background:linear-gradient(150deg,#5B9CFF,#2F6BE0);
+        display:grid;place-items:center;
+        box-shadow:0 8px 20px -8px rgba(47,107,224,.55)}
+  h1{font-size:25px;font-weight:650;letter-spacing:.1px}
+  .sub{color:var(--muted);font-size:13px;margin-top:5px}
+  .tagline{color:var(--faint);font-size:12px;text-align:right;line-height:1.85}
+  .tagline b{color:var(--accent);font-weight:600}
+
+  .sec{display:flex;align-items:baseline;gap:12px;margin:0 0 16px}
+  .sec h2{font-size:15px;font-weight:600}
+  .sec span{color:var(--faint);font-size:12px}
+  .row{display:flex;gap:48px;align-items:flex-start;flex-wrap:wrap;margin-bottom:46px}
+
+  .cap{display:flex;align-items:center;gap:8px;margin-bottom:11px;
+       color:var(--muted);font-size:12.5px}
+  .cap i{width:6px;height:6px;border-radius:50%;background:var(--accent);display:block}
+
+  .win{background:var(--win);border:1px solid var(--line2);border-radius:11px;
+       overflow:hidden;box-shadow:0 18px 44px -22px rgba(16,24,40,.30)}
+  .titlebar{height:36px;display:flex;align-items:center;gap:8px;padding:0 8px 0 14px;
+            background:#FBFCFE;border-bottom:1px solid var(--line)}
+  .titlebar .t{font-size:12.5px;color:#3D4855}
+  .wbtn{margin-left:auto;display:flex}
+  .wbtn u{width:36px;height:25px;display:grid;place-items:center;color:#7A8593;
+          text-decoration:none;font-size:11px;border-radius:4px}
+  .wbtn u.c{color:#5B6775}
+
+  /* ---------- 主窗口 ---------- */
+  .main{width:620px;padding:18px 20px 20px}
+
+  .appbar{display:flex;align-items:center;gap:11px;margin-bottom:16px}
+  .appbar .mk{width:32px;height:32px;border-radius:9px;display:grid;place-items:center;
+        background:linear-gradient(150deg,#5B9CFF,#2F6BE0);
+        box-shadow:0 6px 14px -7px rgba(47,107,224,.6)}
+  .appbar .nm{font-size:14.5px;font-weight:640}
+  .appbar .ver{font-size:10.5px;color:var(--faint);font-family:var(--mono);
+        border:1px solid var(--line);border-radius:5px;padding:1px 6px;margin-left:1px}
+  .appbar .acts{margin-left:auto;display:flex;gap:7px}
+  .ibtn{height:29px;padding:0 11px;border-radius:7px;border:1px solid var(--line2);
+        background:#fff;color:#48566A;font-size:12px;display:flex;align-items:center;gap:6px}
+  .ibtn svg{opacity:.75}
+
+  /* 状态横幅 */
+  .hero{border:1px solid var(--line);border-radius:10px;padding:13px 14px;
+        background:var(--card2);position:relative;overflow:hidden}
+  .hero::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;
+        background:var(--ok)}
+  .hero.run{background:var(--okBg);border-color:#CFE9DA}
+  .hero.wait{background:var(--warnBg);border-color:#F1DFBC}
+  .hero.wait::before{background:var(--warn)}
+  .hero.idle::before{background:#B6C0CC}
+  .hrow{display:flex;align-items:center;gap:10px}
+  .dot{width:8px;height:8px;border-radius:50%;background:#B6C0CC;flex:0 0 auto}
+  .hero.run .dot{background:var(--ok);box-shadow:0 0 0 3px rgba(22,163,74,.14)}
+  .hero.wait .dot{background:var(--warn);box-shadow:0 0 0 3px rgba(217,119,6,.14)}
+  .hstate{font-size:15.5px;font-weight:640}
+  .hstate em{font-style:normal;color:var(--muted);font-weight:500;font-size:12.5px;
+             margin-left:8px}
+  .switch{margin-left:auto;display:flex;align-items:center;gap:8px;
+          font-size:11.5px;color:var(--muted)}
+  .sw{width:36px;height:20px;border-radius:10px;background:var(--accent);position:relative}
+  .sw s{position:absolute;top:2.5px;right:2.5px;width:15px;height:15px;border-radius:50%;
+       background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.25)}
+  .sw.off{background:#C9D2DD}
+  .sw.off s{right:auto;left:2.5px}
+  .hmeta{margin-top:7px;color:var(--muted);font-size:11.5px;display:flex;gap:14px;
+         align-items:center;flex-wrap:wrap}
+  .hmeta b{font-family:var(--mono);font-weight:500;color:#2C3644}
+
+  /* 区块标题 */
+  .lbl{display:flex;align-items:center;gap:8px;margin:18px 0 9px;
+       color:#48566A;font-size:11.5px;letter-spacing:.3px}
+  .lbl::after{content:"";flex:1;height:1px;background:var(--line)}
+
+  /* 角色卡 */
+  .roles{display:flex;gap:9px}
+  .role{flex:1;border-radius:9px;border:1px solid var(--line2);background:#fff;
+        padding:11px 12px 10px;position:relative}
+  .role.on{border-color:var(--accent);background:var(--accentBg);
+        box-shadow:0 0 0 1px var(--accent)}
+  .role .rt{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;
+        color:#2C3644}
+  .role.on .rt{color:#1B4FBF}
+  .role .rd{margin-top:5px;color:var(--muted);font-size:11px;line-height:1.55}
+  .role.on .rd{color:#3C6BC4}
+  .chk{position:absolute;top:9px;right:9px;width:16px;height:16px;border-radius:50%;
+       background:var(--accent);display:none;place-items:center}
+  .role.on .chk{display:grid}
+
+  /* 配置 */
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:9px 10px}
+  .grid.one{grid-template-columns:1fr}
+  .fld{background:#fff;border:1px solid var(--line2);border-radius:8px;
+       padding:7px 10px 8px}
+  .fld .fl{font-size:10.5px;color:var(--faint)}
+  .fld .fv{margin-top:2px;font-size:13px;display:flex;align-items:center;gap:5px}
+  .fld .fv b{font-family:var(--mono);font-weight:500;color:#1B2533}
+  .fld .caret{margin-left:auto;color:#98A3B0;font-size:9px}
+  .fld .unit{color:var(--faint);font-size:11px;font-family:var(--mono)}
+  .fld .tail{margin-left:auto;color:var(--faint);font-size:10.5px}
+  .hint{margin-top:7px;color:var(--faint);font-size:11px;line-height:1.55}
+  .hint kbd{font-family:var(--mono);font-size:10px;color:#46536A;
+       border:1px solid var(--line2);border-bottom-width:2px;border-radius:4px;
+       padding:0 4px;background:#F7F9FC}
+
+  /* 底部动作 */
+  .foot{display:flex;gap:9px;margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}
+  .cta{flex:1;height:42px;border-radius:9px;border:0;font-size:14px;font-weight:640;
+       letter-spacing:.4px;color:#fff;display:flex;align-items:center;justify-content:center;
+       gap:8px;background:linear-gradient(180deg,#4C8DFF,#2F6BE0);
+       box-shadow:0 8px 18px -10px rgba(47,107,224,.9)}
+  .cta.warn{background:linear-gradient(180deg,#E9A23B,#D97706);
+       box-shadow:0 8px 18px -10px rgba(217,119,6,.9)}
+  .ghost{width:104px;height:42px;border-radius:9px;border:1px solid var(--line2);
+       background:#fff;color:#48566A;font-size:13px;display:flex;align-items:center;
+       justify-content:center;gap:6px}
+  .ghost.dis{color:#AEB8C4;border-color:#E8ECF2;background:#FBFCFE}
+
+  /* ---------- 状态窗口 ---------- */
+  .stat{width:540px;padding:14px 16px 16px}
+  .srow{display:flex;align-items:center;gap:9px;padding:8px 2px;
+        border-bottom:1px solid #F0F3F7;font-size:12.5px}
+  .srow:last-child{border-bottom:0}
+  .srow .k{color:#5B6775;width:96px;flex:0 0 auto}
+  .srow .v{color:#1B2533;font-family:var(--mono);font-size:12px}
+  .srow .v.good{color:var(--ok)}
+  .srow .v.warn{color:var(--warn)}
+  .srow .tail{margin-left:auto;color:var(--faint);font-size:10.5px;font-family:var(--mono)}
+  .bars{display:flex;align-items:flex-end;gap:2px;height:18px;width:110px}
+  .bars i{flex:1;background:#C7D6EC;border-radius:1px}
+  .bars i.hi{background:var(--accent2)}
+  .bars i.pk{background:var(--ok)}
+
+  /* ---------- 日志窗口 ---------- */
+  .log{width:620px}
+  .logbar{display:flex;align-items:center;gap:8px;padding:9px 14px;
+          border-bottom:1px solid var(--line);background:#FBFCFE}
+  .search{flex:1;height:27px;border-radius:7px;border:1px solid var(--line2);
+          background:#fff;display:flex;align-items:center;gap:7px;padding:0 9px;
+          color:var(--faint);font-size:11.5px}
+  .pill{height:23px;border-radius:6px;border:1px solid var(--line2);background:#fff;
+        color:#5B6775;font-size:11px;display:flex;align-items:center;padding:0 8px;gap:5px}
+  .logbody{background:#fff;padding:10px 0 12px;height:232px;overflow:hidden;
+           font-family:var(--mono);font-size:11.5px;line-height:1.85}
+  .ln{display:flex;gap:9px;padding:0 14px}
+  .ln .ts{color:#98A3B0;flex:0 0 auto}
+  .ln .lv{flex:0 0 auto;width:42px;text-align:center;border-radius:3px;font-size:9.5px;
+       padding:0 2px;line-height:1.6;height:16px;margin-top:2px}
+  .lv.i{color:#2F6BE0;background:#EDF3FF}
+  .lv.w{color:#B45309;background:#FEF6E7}
+  .lv.e{color:#B91C1C;background:#FEEAEA}
+  .ln .msg{color:#37414F}
+  .ln .msg u{color:#98A3B0;text-decoration:none}
+  .ln .msg b{color:#15803D;font-weight:500}
+
+  /* 规范 */
+  .spec{display:flex;gap:52px;flex-wrap:wrap;border-top:1px solid #DFE4EC;padding-top:26px}
+  .spec h3{font-size:12px;color:#48566A;letter-spacing:.4px;margin-bottom:12px;font-weight:600}
+  .swatches{display:flex;gap:11px}
+  .sw2{width:74px}
+  .sw2 .chip{height:40px;border-radius:8px;border:1px solid rgba(16,24,40,.09)}
+  .sw2 .nm{font-size:10.5px;color:var(--muted);margin-top:6px}
+  .sw2 .hx{font-family:var(--mono);font-size:9.5px;color:var(--faint)}
+  .type li{list-style:none;margin-bottom:10px}
+  .type .t1{font-size:25px;font-weight:650}
+  .type .t2{font-size:15.5px;font-weight:640}
+  .type .t3{font-size:13px;font-weight:600}
+  .type .t4{font-size:12px;color:var(--muted)}
+  .type .t5{font-size:11px;color:var(--faint)}
+  .type small{font-family:var(--mono);color:var(--faint);font-size:9.5px;margin-left:9px}
+  .notes{color:var(--muted);font-size:12px;line-height:1.95;max-width:480px}
+  .notes b{color:#2C3644;font-weight:600}
+  .notes .k{font-family:var(--mono);color:#15803D}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <div class="mark">
+      <svg width="26" height="26" viewBox="0 0 16 16" fill="#fff">
+        <rect x="2" y="3.2" width="12" height="2.1"/>
+        <rect x="2" y="6.95" width="12" height="2.1"/>
+        <rect x="2" y="10.7" width="12" height="2.1"/>
+      </svg>
+    </div>
+    <div>
+      <h1>Com Bridge · 界面改版视觉稿 v2</h1>
+      <div class="sub">双机键鼠越界 + 音频同步 · 浅色主题</div>
+    </div>
+  </div>
+  <div class="tagline">
+    v2 · 浅色 · 状态留在次级窗口<br>
+    窗口 620×660 / 状态窗 540 / 日志窗 620<br>
+    图标 = 三条横线（与托盘同母题）
+  </div>
+</header>
+
+<!-- 主窗口 -->
+<div class="sec"><h2>01 主窗口</h2><span>左：主电脑运行中　中：副电脑等待主电脑　右：未启动</span></div>
+<div class="row">
+
+  <!-- 运行中 -->
+  <div class="frame">
+    <div class="cap"><i style="background:var(--ok)"></i>运行中 · 主电脑</div>
+    <div class="win">
+      <div class="titlebar">
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="#7A8593">
+          <rect x="2" y="3.2" width="12" height="2.1"/><rect x="2" y="6.95" width="12" height="2.1"/>
+          <rect x="2" y="10.7" width="12" height="2.1"/></svg>
+        <span class="t">Com Bridge</span>
+        <div class="wbtn"><u>—</u><u>▢</u><u class="c">✕</u></div>
+      </div>
+      <div class="main">
+        <div class="appbar">
+          <div class="mk">
+            <svg width="18" height="18" viewBox="0 0 16 16" fill="#fff">
+              <rect x="2" y="3.2" width="12" height="2.1"/><rect x="2" y="6.95" width="12" height="2.1"/>
+              <rect x="2" y="10.7" width="12" height="2.1"/></svg>
+          </div>
+          <div class="nm">Com Bridge</div>
+          <div class="ver">0.3.1</div>
+          <div class="acts">
+            <div class="ibtn">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#5B6775" stroke-width="2"><path d="M4 19V9M10 19V5M16 19v-7M22 19v-3"/></svg>
+              实时状态
+            </div>
+            <div class="ibtn">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#5B6775" stroke-width="2"><path d="M5 4h14v16l-7-4-7 4z"/></svg>
+              日志
+            </div>
+          </div>
+        </div>
+
+        <div class="hero run">
+          <div class="hrow">
+            <span class="dot"></span>
+            <span class="hstate">运行中<em>主电脑</em></span>
+            <span class="switch">开机自启<span class="sw"><s></s></span></span>
+          </div>
+          <div class="hmeta">
+            <span>已连接 <b>192.168.10.201</b></span>
+            <span>缓冲 <b>60</b> ms</span>
+          </div>
+        </div>
+
+        <div class="lbl">这台电脑的角色</div>
+        <div class="roles">
+          <div class="role on">
+            <div class="chk"><svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round"><path d="M4 13l5 5L20 6"/></svg></div>
+            <div class="rt">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#1B4FBF" stroke-width="1.8"><rect x="2.5" y="4" width="19" height="12" rx="1.6"/><path d="M8 20h8M12 16v4"/></svg>
+              主电脑
+            </div>
+            <div class="rd">接键鼠与音箱，声音输出到本机</div>
+          </div>
+          <div class="role">
+            <div class="rt">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#5B6775" stroke-width="1.8"><rect x="2.5" y="4" width="19" height="12" rx="1.6"/><path d="M8 20h8M12 16v4"/></svg>
+              副电脑
+            </div>
+            <div class="rd">静音本机扬声器，把声音送到主电脑</div>
+          </div>
+        </div>
+
+        <div class="lbl">主电脑配置</div>
+        <div class="grid">
+          <div class="fld">
+            <div class="fl">副电脑方位</div>
+            <div class="fv">右侧<span class="caret">▼</span></div>
+          </div>
+          <div class="fld">
+            <div class="fl">延迟目标</div>
+            <div class="fv"><b>60</b><span class="unit">ms</span></div>
+          </div>
+        </div>
+        <div class="hint">方位由主电脑下发给副机，无需在副机重复设置；穿越中按
+          <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Esc</kbd> 可强制收回控制权。</div>
+
+        <div class="foot">
+          <button class="cta">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="#fff"><path d="M8 5l11 7-11 7z"/></svg>
+            启动服务
+          </button>
+          <div class="ghost dis">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#AEB8C4" stroke-width="2.4"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>
+            停止
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 等待主电脑 -->
+  <div class="frame">
+    <div class="cap"><i style="background:var(--warn)"></i>等待主电脑 · 副电脑</div>
+    <div class="win">
+      <div class="titlebar">
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="#7A8593">
+          <rect x="2" y="3.2" width="12" height="2.1"/><rect x="2" y="6.95" width="12" height="2.1"/>
+          <rect x="2" y="10.7" width="12" height="2.1"/></svg>
+        <span class="t">Com Bridge</span>
+        <div class="wbtn"><u>—</u><u>▢</u><u class="c">✕</u></div>
+      </div>
+      <div class="main">
+        <div class="appbar">
+          <div class="mk"><svg width="18" height="18" viewBox="0 0 16 16" fill="#fff">
+            <rect x="2" y="3.2" width="12" height="2.1"/><rect x="2" y="6.95" width="12" height="2.1"/>
+            <rect x="2" y="10.7" width="12" height="2.1"/></svg></div>
+          <div class="nm">Com Bridge</div>
+          <div class="ver">0.3.1</div>
+          <div class="acts">
+            <div class="ibtn"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#5B6775" stroke-width="2"><path d="M4 19V9M10 19V5M16 19v-7M22 19v-3"/></svg>实时状态</div>
+            <div class="ibtn"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#5B6775" stroke-width="2"><path d="M5 4h14v16l-7-4-7 4z"/></svg>日志</div>
+          </div>
+        </div>
+
+        <div class="hero wait">
+          <div class="hrow">
+            <span class="dot"></span>
+            <span class="hstate">等待主电脑<em>已等 12s · 探测 4 次</em></span>
+            <span class="switch">开机自启<span class="sw"><s></s></span></span>
+          </div>
+          <div class="hmeta">
+            <span>目标 <b>192.168.10.12</b></span>
+            <span>就绪后自动握手，无需手动重启</span>
+          </div>
+        </div>
+
+        <div class="lbl">这台电脑的角色</div>
+        <div class="roles">
+          <div class="role">
+            <div class="rt">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#5B6775" stroke-width="1.8"><rect x="2.5" y="4" width="19" height="12" rx="1.6"/><path d="M8 20h8M12 16v4"/></svg>
+              主电脑
+            </div>
+            <div class="rd">接键鼠与音箱，声音输出到本机</div>
+          </div>
+          <div class="role on">
+            <div class="chk"><svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round"><path d="M4 13l5 5L20 6"/></svg></div>
+            <div class="rt">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#1B4FBF" stroke-width="1.8"><rect x="2.5" y="4" width="19" height="12" rx="1.6"/><path d="M8 20h8M12 16v4"/></svg>
+              副电脑
+            </div>
+            <div class="rd">静音本机扬声器，把声音送到主电脑</div>
+          </div>
+        </div>
+
+        <div class="lbl">副电脑配置</div>
+        <div class="grid one">
+          <div class="fld">
+            <div class="fl">主电脑 IP</div>
+            <div class="fv"><b>192.168.10.12</b><span class="tail">已记住</span></div>
+          </div>
+        </div>
+        <div class="grid" style="margin-top:9px">
+          <div class="fld">
+            <div class="fl">延迟目标</div>
+            <div class="fv"><b>60</b><span class="unit">ms</span></div>
+          </div>
+          <div class="fld" style="border-style:dashed;background:#FBFCFE">
+            <div class="fl">副电脑方位</div>
+            <div class="fv" style="color:#98A3B0">由主电脑下发</div>
+          </div>
+        </div>
+        <div class="hint">主电脑通常比副电脑启动慢；本程序会持续重试，期间键盘鼠标仍归本机。</div>
+
+        <div class="foot">
+          <button class="cta warn">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            取消等待
+          </button>
+          <div class="ghost">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#48566A" stroke-width="2.4"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>
+            停止
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 未启动 -->
+  <div class="frame">
+    <div class="cap"><i style="background:#B6C0CC"></i>未启动</div>
+    <div class="win">
+      <div class="titlebar">
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="#7A8593">
+          <rect x="2" y="3.2" width="12" height="2.1"/><rect x="2" y="6.95" width="12" height="2.1"/>
+          <rect x="2" y="10.7" width="12" height="2.1"/></svg>
+        <span class="t">Com Bridge</span>
+        <div class="wbtn"><u>—</u><u>▢</u><u class="c">✕</u></div>
+      </div>
+      <div class="main">
+        <div class="appbar">
+          <div class="mk"><svg width="18" height="18" viewBox="0 0 16 16" fill="#fff">
+            <rect x="2" y="3.2" width="12" height="2.1"/><rect x="2" y="6.95" width="12" height="2.1"/>
+            <rect x="2" y="10.7" width="12" height="2.1"/></svg></div>
+          <div class="nm">Com Bridge</div>
+          <div class="ver">0.3.1</div>
+          <div class="acts">
+            <div class="ibtn"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#5B6775" stroke-width="2"><path d="M4 19V9M10 19V5M16 19v-7M22 19v-3"/></svg>实时状态</div>
+            <div class="ibtn"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#5B6775" stroke-width="2"><path d="M5 4h14v16l-7-4-7 4z"/></svg>日志</div>
+          </div>
+        </div>
+
+        <div class="hero idle">
+          <div class="hrow">
+            <span class="dot"></span>
+            <span class="hstate">未启动</span>
+            <span class="switch">开机自启<span class="sw off"><s></s></span></span>
+          </div>
+          <div class="hmeta"><span>选择角色后点「启动服务」</span></div>
+        </div>
+
+        <div class="lbl">这台电脑的角色</div>
+        <div class="roles">
+          <div class="role">
+            <div class="rt">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#5B6775" stroke-width="1.8"><rect x="2.5" y="4" width="19" height="12" rx="1.6"/><path d="M8 20h8M12 16v4"/></svg>
+              主电脑
+            </div>
+            <div class="rd">接键鼠与音箱，声音输出到本机</div>
+          </div>
+          <div class="role">
+            <div class="rt">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#5B6775" stroke-width="1.8"><rect x="2.5" y="4" width="19" height="12" rx="1.6"/><path d="M8 20h8M12 16v4"/></svg>
+              副电脑
+            </div>
+            <div class="rd">静音本机扬声器，把声音送到主电脑</div>
+          </div>
+        </div>
+
+        <div class="lbl">主电脑配置</div>
+        <div class="grid">
+          <div class="fld"><div class="fl">副电脑方位</div><div class="fv">右侧<span class="caret">▼</span></div></div>
+          <div class="fld"><div class="fl">延迟目标</div><div class="fv"><b>60</b><span class="unit">ms</span></div></div>
+        </div>
+
+        <div class="foot" style="margin-top:34px">
+          <button class="cta">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="#fff"><path d="M8 5l11 7-11 7z"/></svg>
+            启动服务
+          </button>
+          <div class="ghost dis">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#AEB8C4" stroke-width="2.4"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>
+            停止
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 次级窗口 -->
+<div class="sec"><h2>02 次级窗口</h2><span>状态与日志仍留在独立窗口（按你的决定：不搬进主界面）</span></div>
+<div class="row">
+  <div class="frame">
+    <div class="cap"><i></i>实时状态 · 每 500ms 刷新</div>
+    <div class="win">
+      <div class="titlebar">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#7A8593" stroke-width="2"><path d="M4 19V9M10 19V5M16 19v-7M22 19v-3"/></svg>
+        <span class="t">实时状态</span>
+        <div class="wbtn"><u>—</u><u class="c">✕</u></div>
+      </div>
+      <div class="stat">
+        <div class="srow"><span class="k">连接</span><span class="v good">已连接 · 副电脑在线</span><span class="tail">192.168.10.201</span></div>
+        <div class="srow"><span class="k">控制权</span><span class="v">本机</span><span class="tail">未穿越</span></div>
+        <div class="srow"><span class="k">输入转发</span><span class="v">1 284 事件</span><span class="tail">键盘 312 / 鼠标 972</span></div>
+        <div class="srow"><span class="k">音频缓冲</span><span class="v">61 ms</span><span class="tail">目标 60 · ratio 1.0002</span></div>
+        <div class="srow"><span class="k">音频电平</span>
+          <span class="bars"><i style="height:5px"></i><i style="height:9px"></i><i class="hi" style="height:13px"></i>
+            <i class="hi" style="height:16px"></i><i class="pk" style="height:18px"></i><i class="hi" style="height:14px"></i>
+            <i style="height:10px"></i><i style="height:7px"></i><i class="hi" style="height:12px"></i><i style="height:8px"></i></span>
+          <span class="tail">48 kHz · 未削波</span></div>
+        <div class="srow"><span class="k">丢包 / 断口</span><span class="v">0 / 0</span><span class="tail">最大偏差 0.0 ms</span></div>
+        <div class="srow"><span class="k">键盘钩子</span><span class="v good">正常</span><span class="tail">吞 312 / 放行 0</span></div>
+        <div class="srow"><span class="k">副电脑桌面</span><span class="v">4480 × 1600</span><span class="tail">比例映射</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="frame">
+    <div class="cap"><i></i>日志 · 按级别着色</div>
+    <div class="win log">
+      <div class="titlebar">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#7A8593" stroke-width="2"><path d="M5 4h14v16l-7-4-7 4z"/></svg>
+        <span class="t">日志</span>
+        <div class="wbtn"><u>—</u><u class="c">✕</u></div>
+      </div>
+      <div class="logbar">
+        <div class="search">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#98A3B0" stroke-width="2.2"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>
+          搜索关键字…
+        </div>
+        <div class="pill">全部级别 ▾</div>
+        <div class="pill">自动滚动 <span style="color:var(--ok)">●</span></div>
+      </div>
+      <div class="logbody">
+        <div class="ln"><span class="ts">13:36:49.103</span><span class="lv i">INFO</span><span class="msg">静默启动（--autostart）：窗口不显示 <u>· 托盘就绪</u></span></div>
+        <div class="ln"><span class="ts">13:36:50.614</span><span class="lv i">INFO</span><span class="msg">低级钩子已安装：穿越期间将吞掉本机键鼠输入</span></div>
+        <div class="ln"><span class="ts">13:36:50.616</span><span class="lv i">INFO</span><span class="msg">键盘钩子自检通过（回调可达）</span></div>
+        <div class="ln"><span class="ts">13:36:51.380</span><span class="lv i">INFO</span><span class="msg">agent 上报地址 <b>192.168.10.201</b> → 用它转发输入</span></div>
+        <div class="ln"><span class="ts">13:41:05.243</span><span class="lv w">WARN</span><span class="msg">agent 重连（主机重建期间断开 4 次，已自动恢复）</span></div>
+        <div class="ln"><span class="ts">13:44:02.881</span><span class="lv i">INFO</span><span class="msg">音频：peer 水位 61ms / 目标 60ms · 削波 0 · 见底 0</span></div>
+        <div class="ln"><span class="ts">13:47:19.512</span><span class="lv e">ERR</span><span class="msg">入站时间线断口 ×1：ts 偏差 +4.2ms <u>· 已计入诊断</u></span></div>
+        <div class="ln"><span class="ts">13:48:30.004</span><span class="lv i">INFO</span><span class="msg">光标越界（right）→ 开始转发输入</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 规范 -->
+<div class="sec"><h2>03 设计规范</h2><span>落地时替换 com_bridge/ui_theme.py 的常量</span></div>
+<div class="spec">
+  <div>
+    <h3>色板</h3>
+    <div class="swatches">
+      <div class="sw2"><div class="chip" style="background:#FFFFFF"></div><div class="nm">卡片</div><div class="hx">#FFFFFF</div></div>
+      <div class="sw2"><div class="chip" style="background:#EEF1F5"></div><div class="nm">窗口底</div><div class="hx">#EEF1F5</div></div>
+      <div class="sw2"><div class="chip" style="background:#2F6BE0"></div><div class="nm">主色</div><div class="hx">#2F6BE0</div></div>
+      <div class="sw2"><div class="chip" style="background:#16A34A"></div><div class="nm">运行</div><div class="hx">#16A34A</div></div>
+      <div class="sw2"><div class="chip" style="background:#D97706"></div><div class="nm">等待</div><div class="hx">#D97706</div></div>
+      <div class="sw2"><div class="chip" style="background:#B91C1C"></div><div class="nm">错误</div><div class="hx">#B91C1C</div></div>
+    </div>
+  </div>
+  <div>
+    <h3>字号（Segoe UI Variable / 微软雅黑 UI）</h3>
+    <ul class="type">
+      <li><span class="t1">运行中</span><small>15.5 / 640 状态</small></li>
+      <li><span class="t2">Com Bridge</span><small>14.5 / 640 品牌</small></li>
+      <li><span class="t3">这台电脑的角色</span><small>13 / 600 区块</small></li>
+      <li><span class="t4">已连接 192.168.10.201 · 缓冲 60 ms</span><small>11.5 / 400 正文</small></li>
+      <li><span class="t5">方位由主电脑下发给副机</span><small>11 / 400 提示</small></li>
+    </ul>
+  </div>
+  <div>
+    <h3>落地方式</h3>
+    <p class="notes">
+      <b>零依赖</b>：圆角卡片、开关、电平条、图标全部用 <span class="k">tk.Canvas</span> 自绘。<br>
+      <b>一屏之内</b>：620×660，不需要滚动；配置项最多两项。<br>
+      <b>状态仍留在次级窗口</b>：主界面只放「运行中/等待/未启动」一行摘要 + 对端地址与缓冲。<br>
+      <b>三个状态各有专属配色</b>：运行=绿底、等待=琥珀底、未启动=灰，一眼分辨。
+    </p>
+  </div>
+</div>
+
+</body>
+</html>

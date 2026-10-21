@@ -64,13 +64,19 @@ def test_gui_has_toggle_and_state():
     build = _strip_comments(inspect.getsource(gui_mod.ComBridgeGui._build))
     assert "开机自启" in build, "按钮区必须有开机自启入口"
     assert "_refresh_elev_state" in build, "启动时必须刷新自启状态"
+    # ★ 2026-10-21: 浅色版把"开机自启"按钮换成了 Canvas 胶囊开关。
+    #   实际实现移到 `_on_autostart_switch`(开关是"目标态"语义),
+    #   `_on_elev_toggle` 保留为翻转入口(托盘菜单/旧调用方)。
+    assert hasattr(gui_mod.ComBridgeGui, "_on_autostart_switch")
     assert hasattr(gui_mod.ComBridgeGui, "_on_elev_toggle")
-    toggle = _strip_comments(
-        inspect.getsource(gui_mod.ComBridgeGui._on_elev_toggle))
-    assert "autostart" in toggle, "按钮必须走 autostart(静默)模块"
-    assert "request_elevated" not in toggle, \
+    impl = _strip_comments(
+        inspect.getsource(gui_mod.ComBridgeGui._on_autostart_switch))
+    assert "autostart" in impl, "开关必须走 autostart(静默)模块"
+    assert "request_elevated" not in impl, \
         "不得再走提权流程(会弹 UAC, 违背静默要求)"
-    assert "is_enabled" in toggle, "已启用→关闭, 未启用→开启"
+    assert "is_enabled" in impl, "已启用→关闭, 未启用→开启"
+    # 开关入口必须真的接到 Canvas 开关上
+    assert "_on_autostart_switch" in build, "Canvas 开关必须绑定这个回调"
 
 
 def test_gui_child_dispatch():

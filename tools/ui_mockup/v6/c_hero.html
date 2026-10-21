@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<style>
+  html,body{margin:0;padding:0}
+  *{box-sizing:border-box;-webkit-font-smoothing:antialiased}
+  body{font-family:"Segoe UI Variable Display","Segoe UI","Microsoft YaHei UI",system-ui,sans-serif;
+       width:620px;height:690px;display:flex;flex-direction:column;overflow:hidden;background:#fff;color:#101828}
+  .tb{height:30px;flex:none;display:flex;align-items:center;gap:8px;padding:0 12px 0 10px;
+      background:#16276B;border-bottom:1px solid rgba(255,255,255,.08);font-size:12px;color:rgba(255,255,255,.72)}
+  .tb .cap{flex:1}
+  .wb{width:30px;height:22px;display:grid;place-items:center;font-size:11px;color:rgba(255,255,255,.66)}
+
+  .hero{flex:none;position:relative;padding:0 22px 44px;
+        background:radial-gradient(120% 150% at 88% -10%,#4F7BFF 0%,#2A4ED8 42%,#1B2E8C 100%)}
+  .hinn{position:relative;padding-top:18px}
+  .top{display:flex;align-items:center;gap:10px}
+  .mark{width:26px;height:26px;border-radius:8px;background:rgba(255,255,255,.16);
+        display:grid;place-items:center;border:1px solid rgba(255,255,255,.22)}
+  .nm{font-size:13.5px;font-weight:600;color:#fff;letter-spacing:.2px}
+  .top .sp{flex:1}
+  .ghost{font-size:12px;color:rgba(255,255,255,.82);padding:5px 9px;border-radius:8px;background:rgba(255,255,255,.12)}
+
+  .hline{display:flex;align-items:flex-end;margin-top:26px}
+  .stwrap .st{display:inline-flex;align-items:center;gap:8px;font-size:12px;font-weight:600;color:#BBF7D0}
+  .stwrap .st i{width:7px;height:7px;border-radius:50%;background:#4ADE80;box-shadow:0 0 0 3px rgba(74,222,128,.22)}
+  .stwrap .big{font-size:30px;font-weight:700;color:#fff;letter-spacing:-.6px;margin-top:7px;line-height:1}
+  .lat{margin-left:auto;text-align:right;color:#fff}
+  .lat .n{font-size:34px;font-weight:750;letter-spacing:-1.6px;line-height:1;font-variant-numeric:tabular-nums}
+  .lat .u{font-size:10.5px;color:rgba(255,255,255,.6);margin-top:5px;letter-spacing:.4px}
+  .ips{margin-top:16px;font-size:12px;color:rgba(255,255,255,.72);font-variant-numeric:tabular-nums}
+  .ips b{color:#fff;font-weight:600}
+
+  .sheet{flex:none;margin-top:-26px;border-radius:22px 22px 0 0;background:#fff;
+         padding:6px 0 0;flex:1;display:flex;flex-direction:column}
+  .row{height:66px;display:flex;align-items:center;padding:0 22px;border-bottom:1px solid #F1F3F7}
+  .row:last-child{border-bottom:0}
+  .rt{flex:1}
+  .rt .l{font-size:13px;font-weight:550}
+  .rt .s{font-size:10.5px;color:#98A2B3;margin-top:3px}
+  .seg{display:flex;background:#F2F4F7;border-radius:10px;padding:3px;gap:2px}
+  .seg div{font-size:12px;color:#667085;padding:6px 13px;border-radius:7px}
+  .seg .on{background:#fff;color:#1B2E8C;font-weight:650;
+           box-shadow:0 1px 2px rgba(16,24,40,.14),0 0 0 1px rgba(16,24,40,.04)}
+  .field{display:flex;align-items:center;gap:5px;background:#F2F4F7;border-radius:9px;padding:7px 11px}
+  .field .v{font-size:13.5px;font-weight:650;font-variant-numeric:tabular-nums;min-width:24px;text-align:right}
+  .field .u{font-size:11px;color:#98A2B3}
+  .tg{width:44px;height:25px;border-radius:13px;background:#2A4ED8;position:relative}
+  .tg i{position:absolute;right:2px;top:2px;width:21px;height:21px;border-radius:50%;background:#fff;
+        box-shadow:0 1px 3px rgba(16,24,40,.3)}
+
+  .grow{flex:1}
+  .foot{flex:none;padding:0 22px 20px}
+  .primary{height:50px;border-radius:14px;display:grid;place-items:center;font-size:15px;font-weight:650;
+           background:linear-gradient(180deg,#2F5AF0,#1B2E8C);color:#fff;letter-spacing:.4px;
+           box-shadow:0 1px 2px rgba(27,46,140,.3),0 12px 26px -10px rgba(27,46,140,.75)}
+  .sat{display:flex;justify-content:center;margin-top:8px}
+  .sat span{font-size:12.5px;color:#667085;padding:6px 12px}
+</style></head><body>
+
+<div class="tb">
+  <div class="cap">Com Bridge</div>
+  <div class="wb">︽</div><div class="wb">❐</div><div class="wb">✕</div>
+</div>
+
+<div class="hero">
+  <div class="hinn">
+    <div class="top">
+      <div class="mark">
+        <svg width="15" height="15" viewBox="0 0 20 20" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round"><path d="M6.5 6.5H4.5M15.5 6.5h-2M6.5 13.5H4.5M15.5 13.5h-2M8 10h4"/></svg>
+      </div>
+      <div class="nm">Com Bridge</div>
+      <div class="sp"></div>
+      <div class="ghost">状态</div>
+      <div class="ghost">日志</div>
+    </div>
+
+    <div class="hline">
+      <div class="stwrap">
+        <div class="st"><i></i>运行中</div>
+        <div class="big">主电脑</div>
+      </div>
+      <div class="lat"><div class="n">61</div><div class="u">毫秒 · 端到端</div></div>
+    </div>
+    <div class="ips"><b>192.168.10.12</b> → <b>192.168.10.201</b></div>
+  </div>
+</div>
+
+<div class="sheet">
+  <div class="row">
+    <div class="rt"><div class="l">这台电脑的角色</div><div class="s">主电脑接键盘鼠标与音箱</div></div>
+    <div class="seg"><div class="on">主电脑</div><div>副电脑</div></div>
+  </div>
+  <div class="row">
+    <div class="rt"><div class="l">副电脑方位</div><div class="s">在屏幕右侧越过边界</div></div>
+    <div class="seg"><div>左</div><div class="on">右</div><div>上</div><div>下</div></div>
+  </div>
+  <div class="row">
+    <div class="rt"><div class="l">延迟目标</div><div class="s">音频抖动缓冲，越大越稳</div></div>
+    <div class="field"><div class="v">60</div><div class="u">ms</div></div>
+  </div>
+  <div class="row">
+    <div class="rt"><div class="l">开机自启</div><div class="s">登录后静默启动到托盘</div></div>
+    <div class="tg"><i></i></div>
+  </div>
+  <div class="grow"></div>
+  <div class="foot">
+    <div class="primary">启动服务</div>
+    <div class="sat"><span>停止服务</span></div>
+  </div>
+</div>
+
+</body></html>
