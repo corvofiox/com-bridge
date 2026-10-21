@@ -109,6 +109,15 @@ def _pick_advertised_host(server_host: str) -> str:
     return candidates[0]
 
 
+class HostWaitCancelled(RuntimeError):
+    """等待主电脑期间被用户/上层取消 —— **不是错误**, 界面应显示"已取消"。
+
+    单独一个异常类型是为了让 GUI 能区分:
+      * 真正启动失败(端口占用/声卡异常/IP 配错) -> 红色"启动失败"
+      * 用户按了停止/退出                     -> 灰色"已取消"
+    """
+
+
 class Agent:
     """副电脑(agent)角色: 采集本机音频发给主电脑, 注入主电脑转发的输入。"""
 
@@ -135,12 +144,20 @@ class Agent:
                  prefer_rate: int = 48000, control_port: int | None = None,
                  tone_hz: float = 0.0, side: str = "right",
                  enable_return: bool = True,
-                 enable_clipboard: bool = True):
+                 enable_clipboard: bool = True,
+                 wait_for_host_s: float = 0.0):
         self.name = name
         self.mute_local = mute_local
         self.discover_timeout_s = discover_timeout_s
         self.prefer_rate = prefer_rate
         self.control_port = control_port
+        # ★★★ 等主电脑就绪的最长秒数(0 = 一直等)。
+        #   为什么默认**无限等**(2026-10-21 用户实测): 两台机器都是开机自启,
+        #   主电脑往往比副电脑慢几十秒。旧实现在第一次 connect 失败时直接
+        #   `raise RuntimeError` -> 副机报错退出, 用户必须手动再点一次启动。
+        #   正确行为(与 Deskflow 的 ClientListener 一致): 常驻重试, 主机起来
+        #   后自动完成握手。等待期间 GUI 显示"等待主电脑…", 且可以取消。
+        self.wait_for_host_s = float(wait_for_host_s or 0.0)
         # tone_hz > 0 时用合成正弦代替 WASAPI 采集(自环测试用, 单机无法靠
         # 扬声器验证时也能跑通"采集->传输->对齐->混音->渲染"整条链路)
         self.tone_hz = tone_hz
@@ -198,11 +215,22 @@ class Agent:
         self._down_keys: dict[tuple[int, bool], float] = {}
         self._down_buttons: dict[int, float] = {}
         self._down_guard_lock = threading.Lock()
+        # ★ 等待主电脑的实时状态(给 GUI 显示, 也给测试断言):
+        #   _wait_phase = None(没在等) / "discover"(找不到主机) / "connect"(连不上)
+        self._wait_phase: str | None = None
+        self._wait_since: float = 0.0
+        self._wait_attempts: int = 0
+        self._last_wait_log: float = 0.0
         self.stats = {"frames_sent": 0, "bytes_sent": 0, "events_injected": 0}
 
     # -- 发现 ----------------------------------------------------------
 
     def discover(self) -> str:
+        """单次搜索主电脑(找不到就抛错; 供 CLI/工具使用)。
+
+        ★ 开机自启/冷启动路径**不要**用这个, 用 `_wait_discover()` ——
+          主电脑比副电脑晚起来是常态, 一次没搜到不等于配错了。
+        """
         if self.server_host:
             return self.server_host
         print(f"[agent] 正在搜索局域网主电脑 ({self.discover_timeout_s}s)...", flush=True)
@@ -215,12 +243,115 @@ class Agent:
         print(f"[agent] 发现主电脑 {beacon.name} @ {beacon.host}", flush=True)
         return beacon.host
 
+    # -- 等待主电脑(开机自启/冷启动) ------------------------------------
+
+    def host_wait_state(self) -> tuple[str, float, int] | None:
+        """正在等主电脑就绪时返回 (阶段, 已等秒数, 探测次数); 否则 None。
+
+        阶段: "discover" = 还没找到主电脑广播; "connect" = 找到地址但连不上。
+        GUI 用它把"启动中…"换成"等待主电脑…", 并据此**不触发 20s 启动超时**
+        (那会让等待被误判成失败, 正是用户报的"直接报错")。
+        """
+        phase = self._wait_phase
+        if phase is None:
+            return None
+        return (phase, time.monotonic() - self._wait_since, self._wait_attempts)
+
+    def _begin_wait(self, phase: str) -> None:
+        if self._wait_phase != phase:
+            self._wait_phase = phase
+            self._wait_since = time.monotonic()
+            self._wait_attempts = 0
+            self._last_wait_log = 0.0
+
+    def _clear_wait(self) -> None:
+        self._wait_phase = None
+        self._wait_attempts = 0
+
+    def _park(self, phase: str, what: str) -> None:
+        """记录一次"还在等"; 检查是否该取消/超时。返回即表示继续等。
+
+        打印节流: 第一次一定打, 之后每 10s 一行。不节流会把磁盘日志刷满
+        (日志只保留两个文件, 一晚上就能冲掉事故现场)。
+        """
+        self._wait_attempts += 1
+        elapsed = time.monotonic() - self._wait_since
+        if (not self._stop.is_set()
+                and (self._wait_attempts == 1
+                     or elapsed - self._last_wait_log >= 10.0)):
+            self._last_wait_log = elapsed
+            print(f"[agent] 等待{what}…(第 {self._wait_attempts} 次探测, "
+                  f"已等 {elapsed:.0f}s; 主电脑就绪后会自动握手, "
+                  f"不需要手动重启本程序)", flush=True)
+        limit = self.wait_for_host_s
+        if limit and elapsed >= limit:
+            self._clear_wait()
+            raise RuntimeError(
+                f"等待主电脑超时({limit:g}s): {what} 始终未就绪。\n"
+                f"  请确认主电脑上的 Com Bridge 处于运行状态,"
+                f"且两台机器在同一网段。"
+            )
+
+    def _wait_discover(self) -> str:
+        """反复搜索主电脑广播, 直到搜到 / 超时 / 被取消。"""
+        self._begin_wait("discover")
+        try:
+            while True:
+                if self._stop.is_set():
+                    raise HostWaitCancelled("等待主电脑期间被取消")
+                beacon = BeaconListener(
+                    timeout_s=self.discover_timeout_s).listen_once()
+                if beacon is not None:
+                    self._clear_wait()
+                    print(f"[agent] 发现主电脑 {beacon.name} @ {beacon.host}",
+                          flush=True)
+                    return beacon.host
+                if self._stop.is_set():
+                    raise HostWaitCancelled("等待主电脑期间被取消")
+                self._park("discover", "主电脑广播")
+                if self._stop.wait(1.0):
+                    raise HostWaitCancelled("等待主电脑期间被取消")
+        except BaseException:
+            self._clear_wait()
+            raise
+
+    def _wait_control(self, host: str) -> "ControlClient":
+        """连控制通道; 连不上就等(指数退避 <=5s), 直到连上/超时/被取消。
+
+        ★ 退避上限 5s 与 `_resync_loop` 的重连节奏一致(用户要求"重连间隔
+          压在 5 秒内"), 这样冷启动等待和运行期重连的手感相同。
+        """
+        self._begin_wait("connect")
+        backoff = 1.0
+        try:
+            while True:
+                if self._stop.is_set():
+                    raise HostWaitCancelled("等待主电脑期间被取消")
+                ctrl = ControlClient(host, self.control_port or CONTROL_PORT)
+                if ctrl.connect():
+                    self._clear_wait()
+                    return ctrl
+                try:
+                    ctrl.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._park("connect", f"主电脑 {host} 就绪")
+                if self._stop.wait(backoff):
+                    raise HostWaitCancelled("等待主电脑期间被取消")
+                backoff = min(backoff * 2, 5.0)
+        except BaseException:
+            self._clear_wait()
+            raise
+
     # -- 主流程 --------------------------------------------------------
 
     def start(self) -> None:
         # 同 server: 20ms 发送间隔不能被 15.6ms 系统节拍量化
         enable_high_res_timer()
-        host = self.discover()
+        # ★★ 冷启动: 主电脑可能还没起来 —— 这里**等待**而不是报错。
+        #   两台机器都开机自启时, 副机几乎总是先到; 旧实现第一次连不上就
+        #   raise, 用户看到"启动失败"必须手点一次(用户 2026-10-21 实测报告)。
+        host = self.server_host or self._wait_discover()
         self.server_host = host
 
         # ★ 主电脑 IP 填成本机地址是最容易犯、也最难自查的配置错误:
@@ -242,9 +373,8 @@ class Agent:
             )
 
         # 1. 控制通道 + 对时
-        ctrl = ControlClient(host, self.control_port or CONTROL_PORT)
-        if not ctrl.connect():
-            raise RuntimeError(f"无法连接主电脑控制通道 {host}")
+        # ★ 连不上不是错误: 进入等待(见 _wait_control), 主电脑就绪后握手。
+        ctrl = self._wait_control(host)
         # ★ 在 CAPS 里报告**本机真实地址**: 主电脑要用它当输入转发目标。
         #   不能只靠 TCP 源地址 —— 经过 NAT(如主路由是虚拟机里的 OpenWrt)
         #   时源地址会变成网关, 主电脑把输入事件发到网关就全丢了。
@@ -1336,7 +1466,13 @@ class Agent:
         for t in self._threads:
             t.join(timeout=2.0)
         if self._return_listener_obj is not None:
-            self._return_listener_obj.stop()
+            # ★ 幂等: 取消一次"还在等主电脑"的启动时, GUI 会先 stop() 一次,
+            #   而 start() 的异常清理再 stop() 一次 —— 重复 stop 不能抛。
+            try:
+                self._return_listener_obj.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._return_listener_obj = None
         # ★ 退出前释放残留按键: 进程一退, 副机上再没有人为这些键发 up。
         self._release_stuck_inputs("退出")
         # ★ 必须在销毁 hider 窗口之前恢复光标(停止时若光标仍隐藏,

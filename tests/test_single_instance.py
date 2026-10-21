@@ -79,7 +79,8 @@ def test_gui_main_checks_single_instance():
     assert "notify_existing" in src, "第二实例应唤起已有窗口(符合双击预期)"
     # 必须在创建 GUI **之前**检查(否则会先闪一个窗口再退出)
     i_check = src.index("acquire()")
-    i_gui = src.index("ComBridgeGui()")
+    # 构造调用现在带参数(ComBridgeGui(start_hidden=...)) -> 只匹到左括号
+    i_gui = src.index("ComBridgeGui(")
     assert i_check < i_gui, "互斥检查必须在创建窗口之前"
 
 

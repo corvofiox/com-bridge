@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """开机自启(静默, 无需管理员, 不弹 UAC)。
 
+★ 静默的含义(2026-10-21 用户要求): 自启命令带 `--autostart` 标志, GUI
+  启动后**只建托盘图标 + 自动拉起上次的角色, 不显示主窗口**。用户随时
+  可以从托盘把窗口叫出来。不带标志时行为与手动双击启动完全一致。
+
 ## 为什么不用计划任务(用户明确要求"过程必须静默")
 旧实现用「计划任务 + RunLevel Highest」。**创建最高权限计划任务在
 Windows 上必然需要管理员提权**(UAC 弹窗), 这是系统安全边界, 绕不过。
@@ -38,12 +42,19 @@ import winreg
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 VALUE_NAME = "ComBridge"
 
+# ★★★ 自启标志(2026-10-21 用户要求: "开机自动启动后不弹出 GUI 前台页面,
+#   而是后台静默启动")。
+#   没有它时 exe 与用户双击启动完全一样 -> 主窗口直接出现在屏幕上。
+#   带它启动时 GUI 只创建托盘图标 + 自动拉起上次的角色, **不显示主窗口**
+#   (用户从托盘左键/双击即可随时把窗口调出来)。
+AUTOSTART_FLAG = "--autostart"
+
 # 旧计划任务名(仅用于检测/顺手清理)
 LEGACY_TASK = "ComBridgeElevatedAutostart"
 
 
 def _exe_command() -> str:
-    """自启要执行的命令行(带引号, 路径可能含空格)。
+    """自启要执行的命令行(带引号 + 静默标志, 路径可能含空格)。
 
     ★ 优先用**打包好的 GUI exe**: 即使当前是源码运行, 只要 dist 里
       有 com-bridge-gui.exe, 就登记它 —— 自启要的是一个**不依赖项目
@@ -51,6 +62,11 @@ def _exe_command() -> str:
       源码里的 pythonw -m com_bridge.gui 只在开发机上有效, 一旦移动
       目录或换 Python 版本就失效。
     """
+    return _with_flag(_base_command())
+
+
+def _base_command() -> str:
+    """不带静默标志的可执行命令行。"""
     if getattr(sys, "frozen", False):
         return f'"{os.path.abspath(sys.executable)}"'
     # 源码运行: 找同项目的 dist/com-bridge-gui.exe
@@ -65,6 +81,47 @@ def _exe_command() -> str:
     if os.path.exists(pyw):
         exe = pyw
     return f'"{exe}" -m com_bridge.gui'
+
+
+def _with_flag(cmd: str) -> str:
+    """给命令行补上静默标志(已有则原样返回)。纯函数, 可单测。"""
+    cmd = (cmd or "").strip()
+    if not cmd:
+        return cmd
+    if AUTOSTART_FLAG in cmd.split():
+        return cmd
+    return f"{cmd} {AUTOSTART_FLAG}"
+
+
+def needs_migration(stored: str) -> bool:
+    """已登记的命令是否需要补静默标志(旧版本登记过的不带标志)。"""
+    if not stored:
+        return False
+    return AUTOSTART_FLAG not in stored.split()
+
+
+def migrate_command() -> str:
+    """把已登记的自启命令升级为带静默标志的版本。
+
+    为什么必须做: `enable()` 只在用户**动过开关**时才写注册表, 而
+    旧版本已经写入了不带标志的命令 —— 不迁移的话, 老用户升级后照样
+    会开机弹出窗口, 看起来"修了但没生效"。
+
+    返回: "ok"(已是目标形态)/ "migrated"(已改写)/ "off"(未启用)/ "error"。
+    """
+    if not is_enabled():
+        return "off"
+    try:
+        stored = stored_command()
+        target = _exe_command()
+        if not needs_migration(stored) and stored == target:
+            return "ok"
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                                winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, VALUE_NAME, 0, winreg.REG_SZ, target)
+        return "migrated"
+    except OSError:
+        return "error"
 
 
 def is_enabled() -> bool:

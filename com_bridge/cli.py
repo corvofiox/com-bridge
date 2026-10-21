@@ -239,7 +239,10 @@ def _cmd_agent(args) -> int:
     ag = Agent(server_host=args.host, name=args.name,
                mute_local=not args.keep_audio,
                discover_timeout_s=args.discover_timeout,
-               side=args.side)
+               side=args.side,
+               # CLI 默认也是"一直等"(与 GUI 开机自启一致); 用
+               # --wait-for-host 可以加上限, 便于脚本里快速失败。
+               wait_for_host_s=getattr(args, "wait_for_host", 0.0))
     ag.start()
     try:
         while True:
@@ -413,6 +416,9 @@ def main(argv: list[str] | None = None) -> int:
     pa.add_argument("--keep-audio", action="store_true",
                     help="不静音本机扬声器(会产生双重延迟)")
     pa.add_argument("--discover-timeout", type=float, default=3.0)
+    pa.add_argument("--wait-for-host", type=float, default=0.0,
+                    help="等主电脑就绪的最长秒数(默认 0 = 一直等; "
+                         "主电脑还没启动时不会再直接报错退出)")
     pa.set_defaults(func=_cmd_agent)
 
     pc = sub.add_parser("selfcheck", help="自检")

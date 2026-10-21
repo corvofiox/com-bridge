@@ -79,7 +79,8 @@ def test_gui_child_dispatch():
     src = _strip_comments(inspect.getsource(gui_mod.main))
     i_child = src.index("--elevated-child")
     i_dpi = src.index("_enable_dpi_awareness")
-    i_gui = src.index("ComBridgeGui()")
+    # 构造调用现在带参数(ComBridgeGui(start_hidden=...)) -> 只匹到左括号
+    i_gui = src.index("ComBridgeGui(")
     assert i_child < i_dpi < i_gui, "子进程分发必须先于一切(DPI/GUI)"
 
 

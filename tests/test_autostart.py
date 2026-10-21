@@ -20,11 +20,57 @@ HKCU Run 启动的是**普通权限**进程。本项目运行时不依赖管理�
 import inspect
 import os
 import sys
+import winreg
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import com_bridge.autostart as auto  # noqa: E402
 import com_bridge.gui as gui_mod  # noqa: E402
+
+
+def _read_raw():
+    """读取用户当前的 Run 值; 返回 None 表示"没有这个值"。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, auto.RUN_KEY) as k:
+            try:
+                return winreg.QueryValueEx(k, auto.VALUE_NAME)[0]
+            except FileNotFoundError:
+                return None
+    except OSError:
+        return None
+
+
+def _write_raw(value) -> None:
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, auto.RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as k:
+        if value is None:
+            try:
+                winreg.DeleteValue(k, auto.VALUE_NAME)
+            except FileNotFoundError:
+                pass
+        else:
+            winreg.SetValueEx(k, auto.VALUE_NAME, 0, winreg.REG_SZ, str(value))
+
+
+@pytest.fixture(autouse=True)
+def preserve_user_run_entry():
+    """★★★ 这些测试会**真实读写**用户的 HKCU Run 项(enable/disable 的实现
+    就是如此), 所以必须在结束后把原值**原样恢复**。
+
+    实测踩到(2026-10-21): 跑一次全量测试, 用户的 `ComBridge` 值就被改写
+    成了测试当时写入的命令 —— 而在新旧版本交替期, 那可能意味着"用户的
+    开机自启被静默打开/关闭"。这属于测试污染真实环境, 必须隔离。
+    """
+    saved = _read_raw()
+    try:
+        yield
+    finally:
+        try:
+            _write_raw(saved)
+        except OSError:
+            pass
 
 
 def test_uses_hkcu_run_key():

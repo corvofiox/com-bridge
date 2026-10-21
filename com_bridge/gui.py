@@ -22,7 +22,7 @@ import traceback
 import tkinter as tk
 from tkinter import ttk
 
-from .agent import Agent
+from .agent import Agent, HostWaitCancelled
 from .clock import now_us
 from .server import Server
 
@@ -97,7 +97,7 @@ class _TeeStdout:
 
 
 class ComBridgeGui:
-    def __init__(self) -> None:
+    def __init__(self, start_hidden: bool = False) -> None:
         # 必须先补好 stdout/stderr: 窗口化 exe 里它们是 None, 后面 tee 与
         # 角色代码里的 print 都依赖它
         _ensure_std_streams()
@@ -105,8 +105,18 @@ class ComBridgeGui:
         self.root.title("Com Bridge — 双机键鼠/音频同步")
         self.root.geometry("640x480")
         self.root.minsize(560, 420)
+        # ★★ 开机自启的静默启动(用户要求: "开机自动启动后不弹出 GUI 前台
+        #   页面, 而是后台静默启动")。此时窗口根本不映射, 只有托盘图标 +
+        #   自动拉起上次的角色; 托盘左键 -> _show_from_tray 随时叫出来。
+        #   顺带一个好处: 窗口不显示就不会抢前台, 而"本进程窗口是前台"
+        #   恰好是键盘低级钩子失效的唯一原因(见 _release_focus_for_hook)。
+        self._start_hidden = bool(start_hidden)
 
         self._role: Server | Agent | None = None
+        # ★ 已构造但还没 start() 完的角色(用于取消"等待主电脑"的启动)。
+        #   旧实现里 _on_stop 只认 self._role, 而它要等 start() 返回才被赋值
+        #   —— 于是"等待中"的启动完全无法取消。
+        self._pending_role: Server | Agent | None = None
         self._role_thread: threading.Thread | None = None
         self._stop_thread: threading.Thread | None = None
         # 看门狗: 记录"启动中/停止中"开始的时刻。后台线程若因任何原因
@@ -145,6 +155,19 @@ class ComBridgeGui:
         #   (否则托盘/启动报错的关键信息会被丢弃, 见 _poll 的说明)
         self._log_backlog: list[str] = []
         self._init_tray()
+        if self._start_hidden:
+            # 必须在 mainloop 之前 withdraw: 否则窗口会闪一下再消失
+            try:
+                self.root.withdraw()
+            except tk.TclError:
+                pass
+            self._log_q.put("[gui] 静默启动(开机自启): 主窗口不显示, "
+                            "服务在托盘运行; 左键托盘图标可随时打开窗口")
+            try:
+                from . import gui_log
+                gui_log.write_line("[gui] 静默启动(--autostart): 窗口不显示")
+            except Exception:  # noqa: BLE001
+                pass
         # ★ 恢复上次配置 + 按"上次是否运行中"决定自动重连
         self.root.after(300, self._restore_and_maybe_autostart)
         self.root.after(100, self._poll)
@@ -555,8 +578,27 @@ class ComBridgeGui:
                     role = Agent(server_host=host, name="agent",
                                  mute_local=True, discover_timeout_s=3.0,
                                  side=side or "right", tone_hz=_tone)
+                # ★ 先把角色暴露出去, 再 start(): 副机可能长时间"等待主电脑",
+                #   这期间用户必须能按停止取消(见 _on_stop / _check_watchdog)。
+                self._pending_role = role
                 role.start()
             except BaseException as exc:  # noqa: BLE001
+                # ★ 取消(等待主电脑期间被停止)不是错误: 用灰色"已取消"
+                #   收尾, 不要吓人的"启动失败: HostWaitCancelled"。
+                if isinstance(exc, HostWaitCancelled):
+                    try:
+                        self._log_q.put_nowait("[gui] 已取消: 等待主电脑期间"
+                                              "被停止, 本次启动作废")
+                    except queue.Full:
+                        pass
+                    if role is not None:
+                        try:
+                            role.stop()
+                        except BaseException:
+                            pass
+                    self._pending_role = None
+                    self._ui_queue.put(("cancelled", None))
+                    return
                 # 这里必须用 BaseException 并保证通知一定会发出:
                 # 窗口化 exe 下任何未被捕获的异常都会让本线程静默死亡,
                 # 界面就永久停在"启动中..."。异常信息也要兜住(不能只靠
@@ -576,8 +618,10 @@ class ComBridgeGui:
                         role.stop()
                     except BaseException:
                         pass
+                self._pending_role = None
                 self._ui_queue.put(("error", detail))
                 return
+            self._pending_role = None
             self._role = role
             self._ui_queue.put(("started", role_kind))
 
@@ -800,10 +844,16 @@ class ComBridgeGui:
         self._focus_grace_until = time.monotonic() + seconds
 
     def _on_stop(self) -> None:
-        role = self._role
+        # ★★ 用 _pending_role 兜底: 副机可能长时间卡在"等待主电脑"里,
+        #    此时 start() 还没返回、self._role 仍是 None —— 旧代码直接
+        #    return, 用户只能退出整个程序。现在按停止 = 取消这次启动
+        #    (Agent.stop() 置标志 -> 等待循环抛 HostWaitCancelled ->
+        #     启动线程汇报"已取消", 见 _on_start 的 worker)。
+        role = self._role or self._pending_role
         if role is None or self._stop_thread is not None:
             return
-        self._set_state("停止中...")
+        pending_start = self._role is None
+        self._set_state("取消中..." if pending_start else "停止中...")
         self._mark_pending("stop")
         # ★★★ 用户主动停止 -> 清掉"运行中"标志。
         #   这是"记忆启动状态"的核心语义(用户要求):
@@ -824,6 +874,11 @@ class ComBridgeGui:
                     traceback.print_exc()
                 except BaseException:
                     pass
+            if pending_start:
+                # 取消路径: 由**启动线程**汇报"已取消"(它捕获
+                # HostWaitCancelled), 这里不再重复投递状态, 否则界面会
+                # 先"已停止"再"已取消"地闪一下。
+                return
             self._role = None
             self._ui_queue.put(("stopped", None))
 
@@ -966,6 +1021,15 @@ class ComBridgeGui:
                     self._stop_btn.configure(state="disabled")
                     self._sync_tray(False)
                     self._role_thread = None
+                elif kind == "cancelled":
+                    # 等待主电脑期间被用户取消 —— 不是错误
+                    self._set_state("已取消")
+                    self._pending_role = None
+                    self._start_btn.configure(state="normal")
+                    self._stop_btn.configure(state="disabled")
+                    self._sync_tray(False)
+                    self._role_thread = None
+                    self._stop_thread = None
         except queue.Empty:
             pass
 
@@ -989,6 +1053,21 @@ class ComBridgeGui:
         self._pending_kind = None
         self._pending_since = None
 
+    def _waiting_for_host(self) -> tuple[str, float, int] | None:
+        """当前角色是否正在**等待主电脑就绪**(Agent.host_wait_state 的封装)。
+
+        返回 (阶段, 已等秒数, 探测次数) 或 None。给看门狗用: 等待期间
+        不能把界面的"启动中"判成超时失败。
+        """
+        role = self._pending_role or self._role
+        fn = getattr(role, "host_wait_state", None)
+        if fn is None:
+            return None
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001
+            return None
+
     def _check_watchdog(self) -> None:
         """过渡态超时则恢复按钮并报错, 避免界面永久卡在"启动中/停止中"。
 
@@ -997,6 +1076,32 @@ class ComBridgeGui:
         """
         if self._pending_since is None or self._pending_kind is None:
             return
+        # ★★★ "等待主电脑"是**合法且预期**的长期状态(用户 2026-10-21:
+        #   "副机自启后如果主机启动慢, 它会直接报错, 这不是预期行为")。
+        #   这里把计时基准往后挪 = 视为"仍在正常推进", 并把停止按钮变成
+        #   可用的"取消", 让用户随时能退出等待。
+        wait = self._waiting_for_host()
+        if wait is not None:
+            _phase, elapsed, attempts = wait
+            self._pending_since = now_us() / 1e6
+            self._set_state(f"等待主电脑…(已等 {elapsed:.0f}s, "
+                            f"探测 {attempts} 次)")
+            try:
+                self._stop_btn.configure(state="normal")
+            except tk.TclError:
+                pass
+            # 托盘提示同步一次就够(每 500ms 刷 Shell_NotifyIcon 没必要),
+            # 否则用户悬停在托盘上看到的还是"已停止", 会误以为没在工作。
+            if not getattr(self, "_tray_wait_set", False):
+                self._tray_wait_set = True
+                tray = getattr(self, "_tray", None)
+                if tray is not None:
+                    try:
+                        tray.set_status(False, "Com Bridge · 等待主电脑…")
+                    except Exception:  # noqa: BLE001
+                        pass
+            return
+        self._tray_wait_set = False
         elapsed = now_us() / 1e6 - self._pending_since
         if elapsed < 20.0:
             return
@@ -1311,6 +1416,14 @@ class ComBridgeGui:
         return 0
 
 
+def _is_autostart_argv(argv: list[str]) -> bool:
+    """命令行是否要求**静默启动**(开机自启传入)。
+
+    纯函数, 便于单测: 不创建 Tk、不碰注册表。
+    """
+    return "--autostart" in argv or "--silent" in argv
+
+
 def main() -> int:
     # ★ 提权子进程模式: GUI 的"管理员自启"按钮用 ShellExecuteW(runas)
     #   重新调起**本 exe** 并带 `--elevated-child install|uninstall`。
@@ -1354,6 +1467,10 @@ def main() -> int:
     except Exception:  # noqa: BLE001
         pass
 
+    # ★★ 静默启动标志(开机自启时由 Run 注册表项传入, 见 autostart)。
+    #   语义: 不显示主窗口, 只建托盘 + 自动拉起上次的角色。
+    start_hidden = _is_autostart_argv(argv)
+
     # ★★★ 单实例检查(用户实测: "我能同时启动两个甚至多个")
     #   多实例的真实危害不只是多个窗口:
     #     * 都去 bind 24802/TCP + 4010/UDP -> 后启动的绑定失败;
@@ -1363,16 +1480,37 @@ def main() -> int:
     #   所以第二个实例必须**主动退出**, 并唤起已有窗口(符合用户双击预期)。
     from . import single_instance
     if not single_instance.acquire():
-        single_instance.notify_existing()
+        # ★ 静默启动(开机自启)时**不要**去唤起已有窗口 —— 那会在登录后
+        #   毫无理由地把窗口弹到用户面前, 与"静默"的要求直接冲突。
+        if not start_hidden:
+            single_instance.notify_existing()
         try:
             from . import gui_log
             gui_log.write_line(
-                "[gui] 已有实例在运行 -> 已唤起其窗口, 本次启动退出")
+                "[gui] 已有实例在运行 -> " +
+                ("静默启动, 本次退出" if start_hidden
+                 else "已唤起其窗口, 本次启动退出"))
         except Exception:  # noqa: BLE001
             pass
         return 0
 
-    app = ComBridgeGui()
+    # ★ 自启命令迁移: 旧版本登记的命令不带 --autostart, 不迁移的话老用户
+    #   升级后照样会开机弹窗(看起来"修了但没生效")。注册表读写是微秒级,
+    #   放在主线程没有性能问题。
+    try:
+        from . import autostart as _auto
+        state = _auto.migrate_command()
+        if state == "migrated":
+            try:
+                from . import gui_log
+                gui_log.write_line(f"[gui] 自启命令已升级为静默启动: "
+                                   f"{_auto.stored_command()}")
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
+    app = ComBridgeGui(start_hidden=start_hidden)
     return app.run()
 
 
