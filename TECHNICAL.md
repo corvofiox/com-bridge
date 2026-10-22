@@ -419,6 +419,47 @@ Remove-Item "$env:LOCALAPPDATA\ComBridge\diag_edge.flag"
 | 主机 | `[server][edge] dx=.. 光标=(x,y) 穿越=..` | 物理位移有没有到、判定处于什么状态 |
 | 副机 | `[agent][edge] inj dx=.. (x0,y0) -> (x1,y1)` | 注入前后光标到底有没有动 |
 
+## 剪贴板: 文字 / 图片 / 文件(0.4.2 重做, 对照 Deskflow 源码)
+
+### 照搬 Deskflow 的三件事
+
+读了 `tools/deskflow_full/src/lib/deskflow/{IClipboard.h,Clipboard.cpp,StreamChunker.cpp,ClipboardChunk.cpp}`
+与 `src/lib/platform/MSWindowsClipboard*.cpp` 之后, 确认它是这么做的:
+
+| 方面 | Deskflow 的做法 | 我们对应 |
+|---|---|---|
+| 规范化格式 | `IClipboard::Format` 只有 Text(=0)/HTML(=1)/Bitmap(=2), 各端自己转换 | 同值同序, 另加 Files(=3)(桌面复制文件是 CF_HDROP, Deskflow 没有) |
+| Bitmap 规范 | **BMP 去掉 14 字节文件头**, 即裸 DIB(BI_RGB), 直接 `SetClipboardData(CF_DIB)` | 改成裸 DIB(之前错传了带文件头的 BMP) |
+| 传输 | **TCP**, `StreamChunker` 的 `g_chunkSize = 512 * 1024`, `ClipboardChunk` 用 start/data/end 三种标记, 有序流所以不需要序号重传 | 同结构, 单独一条 TCP 通道(`clip_transfer.py`) |
+| 序列化 | `IClipboard::marshall`: `u32 格式数` + 每个 `u32 id + u32 长度 + 数据` | 照此实现(`clipboard.marshall/unmarshall`) |
+| 防回环 | 注册 `"Deskflow Ownership"` 剪贴板格式, 写入时一并设置, 采样前查它 | 注册 `"Com Bridge Ownership"`, 原来的"写后 1.2 秒不采样"降为兜底 |
+
+### 为什么要换掉原来的 UDP 分块
+
+原来剪贴板走 UDP, 1000 字节一块 + 逐字节位图重组, 上限 8MB。那是为**小文本**设计的:
+
+* 4K 截图的裸 DIB = 3840×2160×4 ≈ **33MB** = 33 万个包, 逐字节位图还要再吃 33MB;
+* 文件动辄几百 MB, 丢任何一块整份作废, 用户只能重来;
+* 接收端缓冲只有 4MB(之前为 8MB 文本调到这个值), 大内容必溢出。
+
+换成 TCP + 512KB 分块后, 顺序/可靠/流控都由内核负责, 代码里不再需要序号、位图、限速。
+
+### 文件传输(Deskflow 这块其实没实现)
+
+`ProtocolTypes.h` 里 `kMsgDFileTransfer` / `kMsgDDragInfo` 都明确标了
+**"@deprecated File drag and drop is no longer implemented."** —— 也就是说
+Deskflow 的拖放文件传输已经废弃, 没有可直接照搬的代码。我们只沿用它的
+**消息语义**(先发清单, 再按文件逐个发内容)并扩展成支持文件夹:
+
+```
+DDRG 语义(清单)  -> 剪贴板内容的 files 格式 = JSON: [{"name": 相对路径, "size": 字节}]
+DFTR 语义(内容)  -> 同一 TCP 连接上, 每个文件: FILE_START(序号, 字节数) + DATA* + FILE_END
+```
+
+接收端强制三道安全边界(不能信对端): 路径消毒(拒 `..`/绝对路径/盘符/保留名/超深
+路径)、总量上限(2GB)、落盘到 `%LOCALAPPDATA%\ComBridge\received\<时间戳>\` 且只保留
+最近 30 批。文件写完才设 `CF_HDROP`, 用户自己粘贴才生效 —— 我们从不执行任何东西。
+
 ## 已知限制
 
 * 仅在**单机自环**下验证过全部纯逻辑单元; 双机端到端(真实网络延迟、晶振偏差、UIPI/权限差异)已在用户的两台真机上长期运行(音频到达率 48kHz、输入转发与会话锁均实测), **但"另一套 KVM/远控软件同装"的场景仍未覆盖** —— 见下条。
@@ -434,7 +475,7 @@ Remove-Item "$env:LOCALAPPDATA\ComBridge\diag_edge.flag"
 ## 测试
 
 ```powershell
-python -m pytest tests/ -q      # 714 项: 协议/对时/缓冲/混音/越界几何/方位/位置映射/钉住公式/钩子控制/加速补偿/RAWMOUSE 布局/卡键防护/键盘钩子自产/钩子回调廉价性与重装自愈/键盘钩子单独死亡检测/交还复核(盲区)/链首抢占机制撤除锁定/GUI日志与自诊/GUI管理员自启(命令行tag/子进程分发/rc判定)/前台抢占(不信返回值+重试)/DPI 感知/注入时间戳判据/三项 BUG 回归/逃生通道(Ctrl+Alt+Esc)/强制交回冷静期/交接去抖(陈旧位移丢弃+hide幂等)/自检异步化/边界现场取证开关/本机漂移不驱动主机光标/慢推进入(confirm_frames=1)/诊断不得改变行为/全屏程序禁止穿越/注入坐标往返无损/全屏前台不抢焦点
+python -m pytest tests/ -q      # 744 项: 协议/对时/缓冲/混音/越界几何/方位/位置映射/钉住公式/钩子控制/加速补偿/RAWMOUSE 布局/卡键防护/键盘钩子自产/钩子回调廉价性与重装自愈/键盘钩子单独死亡检测/交还复核(盲区)/链首抢占机制撤除锁定/GUI日志与自诊/GUI管理员自启(命令行tag/子进程分发/rc判定)/前台抢占(不信返回值+重试)/DPI 感知/注入时间戳判据/三项 BUG 回归/逃生通道(Ctrl+Alt+Esc)/强制交回冷静期/交接去抖(陈旧位移丢弃+hide幂等)/自检异步化/边界现场取证开关/本机漂移不驱动主机光标/慢推进入(confirm_frames=1)/诊断不得改变行为/全屏程序禁止穿越/注入坐标往返无损/剪贴板图片与文件/全屏前台不抢焦点
 python -m com_bridge.cli selfcheck
 ```
 

@@ -250,8 +250,10 @@ DISCOVERY_PORT = 24800          # 与 Deskflow 默认端口一致, 便于错开�
 AUDIO_PORT = 4010              # 与 Scream 一致
 INPUT_PORT = 24801
 CONTROL_PORT = 24802
-# 剪贴板同步(参考 Deskflow 的 ClipboardChunk 分块协议)。
-# 语义: 哪台机器发生"复制", 就由它发到对端的 CLIPBOARD_PORT。
+# 剪贴板同步(参考 Deskflow 的 StreamChunker: TCP + 512KB 分块)。
+# 语义: 哪台机器发生"复制", 就由它连到对端的 CLIPBOARD_PORT(**TCP**)。
+# ★ 0.4.2 起剪贴板从 UDP 改成 TCP —— 传图片(裸 DIB)和文件必须可靠传输,
+#   UDP 分块在大内容上必丢, 详见 clip_transfer.py 的说明。
 # 两台机器各自监听该端口, 于是双向复制都能用。
 CLIPBOARD_PORT = 24803
 

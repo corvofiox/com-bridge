@@ -226,7 +226,7 @@ class Server:
         #   _clip_tx: 把本机复制的内容发给对端(地址在 peer 确定后才知道)
         #   _clip_sync: 监听本机剪贴板变化
         self._clip_rx = None
-        self._clip_tx: ClipboardSender | None = None
+        self._clip_tx = None          # ClipOutbox(TCP 串行发送队列)
         self._clip_sync = None
         self._listener: RawInputListener | None = None
         self._edge: EdgeDetector | None = None
@@ -746,27 +746,29 @@ class Server:
             否则两台机器会无限互发同一份内容。
         """
         from .clipboard_sync import ClipboardSync
-        from .transport import ClipboardReceiver, ClipboardSender
+        from .clip_transfer import ClipInbox, ClipOutbox
 
-        # 接收端(收 peer 复制的): 只启一次
+        # 接收端(TCP 监听, 收 peer 复制的内容): 只启一次
         if self._clip_rx is None:
             try:
-                self._clip_rx = ClipboardReceiver(
-                    on_payload=self._on_clipboard_recv)
-                self._clip_rx.start()
+                inbox = ClipInbox(on_payload=self._on_clipboard_recv)
+                inbox.bind_now()          # 绑定失败要当场抛出来
+                inbox.start()
+                self._clip_rx = inbox
                 print("[server] 剪贴板接收已启动"
-                      f"(端口 {CLIPBOARD_PORT})", flush=True)
+                      f"(TCP 端口 {inbox.port})", flush=True)
             except Exception as exc:  # noqa: BLE001
                 print(f"[server] 剪贴板接收启动失败: {exc}", flush=True)
                 self._clip_rx = None
 
-        # 发送端: peer 地址变了要重建
+        # 发送端(串行发送队列): peer 地址变了要重建
         if self._clip_tx is None or \
-                getattr(self._clip_tx, "addr", (None,))[0] != peer_host:
+                getattr(self._clip_tx, "host", None) != peer_host:
             try:
                 if self._clip_tx is not None:
-                    self._clip_tx.close()
-                self._clip_tx = ClipboardSender(peer_host)
+                    self._clip_tx.stop()
+                self._clip_tx = ClipOutbox(peer_host)
+                self._clip_tx.start()
             except Exception as exc:  # noqa: BLE001
                 print(f"[server] 剪贴板发送初始化失败: {exc}", flush=True)
                 self._clip_tx = None
@@ -774,22 +776,25 @@ class Server:
         # 本机剪贴板监听: 只启一次
         if self._clip_sync is None and self._clip_tx is not None:
             try:
-                self._clip_sync = ClipboardSync(self._on_local_copy)
+                self._clip_sync = ClipboardSync(self._on_local_copy,
+                                                on_files=self._on_local_files)
                 self._clip_sync.start()
-                print("[server] 剪贴板同步已启用(双向)", flush=True)
+                print("[server] 剪贴板同步已启用(双向, 含图片/文件)", flush=True)
             except Exception as exc:  # noqa: BLE001
                 print(f"[server] 剪贴板同步启动失败: {exc}", flush=True)
                 self._clip_sync = None
 
-    def _on_local_copy(self, blob: bytes, seq: int) -> None:
-        """本机发生"复制" -> 发给 peer。"""
+    def _on_local_copy(self, blob: bytes) -> None:
+        """本机发生"复制" -> 放进串行发送队列(TCP)。"""
         tx = self._clip_tx
-        if tx is None:
-            return
-        ok = tx.send_blob(blob, seq)
-        if not ok:
-            print(f"[server] 剪贴板发送部分失败"
-                  f"(累计 {tx.failed} 次)", flush=True)
+        if tx is not None:
+            tx.put(blob)
+
+    def _on_local_files(self, blob: bytes, entries: list) -> None:
+        """本机复制了文件/文件夹 -> 剪贴板内容(带清单) + 文件内容一起发。"""
+        tx = self._clip_tx
+        if tx is not None:
+            tx.put(blob, entries)
 
     def _on_clipboard_recv(self, payload: dict) -> None:
         """收到 peer 的剪贴板 -> 写进本机。
