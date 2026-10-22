@@ -126,6 +126,63 @@ _SHELL_CLASSES = frozenset({
 })
 
 
+def _window_class(hwnd) -> str:
+    """取窗口类名(失败返回空串)。"""
+    try:
+        user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR,
+                                         ctypes.c_int]
+        user32.GetClassNameW.restype = ctypes.c_int
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buf, 256)
+        return buf.value
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def is_foreign_fullscreen(hwnd) -> bool:
+    """该窗口是否**别的进程**的、覆盖整个虚拟桌面的窗口(即"全屏程序")。
+
+    ★ 必须排除外壳/桌面窗口: 用户点击空桌面时 `GetForegroundWindow()`
+      返回的是 explorer 的 Progman/WorkerW, 它**同样覆盖全屏** ——
+      若一并当成"全屏程序", 就会退化成本项目早先反复踩过的
+      "光标在空桌面上隐藏不掉"(见 CursorHider._cursor_guard_visible)。
+
+    ★ 判定用"覆盖整个虚拟桌面"而不是"等于某个显示器": 单个最大化窗口只
+      覆盖一块屏, 不是全屏; 无边框全屏(现代游戏常见)一定覆盖整个虚拟桌面。
+
+    两个用途:
+      * CursorHider: 前台是全屏程序时不抢前台(抢了会把它打断成黑屏);
+      * Server: 前台是全屏程序(游戏/播放器/远程桌面)时**不穿越** ——
+        否则游戏里把鼠标移到屏幕边就会把键鼠交给另一台电脑。
+    """
+    try:
+        if not hwnd:
+            return False
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value == kernel32.GetCurrentProcessId():
+            return False
+        if _window_class(hwnd) in _SHELL_CLASSES:
+            return False
+        r = RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+            return False
+        from .input import virtual_desktop
+        d = virtual_desktop()
+        return rect_covers((r.left, r.top, r.right, r.bottom),
+                           (d.left, d.top, d.right, d.bottom))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def foreign_fullscreen_foreground() -> bool:
+    """当前前台窗口是否别的进程的全屏窗口(游戏/播放器/远程桌面)。"""
+    try:
+        return is_foreign_fullscreen(user32.GetForegroundWindow())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def rect_covers(win, desk) -> bool:
     """窗口矩形是否**完全覆盖**桌面矩形(纯函数, 可单测)。
 
@@ -496,29 +553,8 @@ class CursorHider:
         return False
 
     def _is_foreign_fullscreen(self, hwnd) -> bool:
-        """该窗口是否**别的进程**的、覆盖整个虚拟桌面的窗口(全屏)。
-
-        ★ 必须排除外壳/桌面窗口: 用户点击空桌面时 `GetForegroundWindow()`
-          返回的是 explorer 的 Progman/WorkerW, 它**同样覆盖全屏** ——
-          若一并当成"全屏程序"而放弃抢前台, 就会退化成本项目早先反复
-          踩过的"光标在空桌面上隐藏不掉"(见 _cursor_guard_visible 的说明)。
-        """
-        try:
-            pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if pid.value == kernel32.GetCurrentProcessId():
-                return False
-            if self._window_class(hwnd) in _SHELL_CLASSES:
-                return False
-            r = RECT()
-            if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
-                return False
-            from .input import virtual_desktop
-            d = virtual_desktop()
-            return rect_covers((r.left, r.top, r.right, r.bottom),
-                               (d.left, d.top, d.right, d.bottom))
-        except Exception:  # noqa: BLE001
-            return False
+        """该窗口是否别的进程的全屏窗口(见模块级 is_foreign_fullscreen)。"""
+        return is_foreign_fullscreen(hwnd)
 
     @staticmethod
     def _window_class(hwnd) -> str:

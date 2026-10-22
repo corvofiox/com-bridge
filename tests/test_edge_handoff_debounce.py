@@ -450,3 +450,59 @@ class TestDiagNeverChangesBehavior:
         assert i_inj < i_diag, "必须先注入再记日志"
         assert "_diag_inject(" not in src, "旧的'诊断内部注入'写法必须消失"
 
+
+
+# ===========================================================================
+# 7. 全屏程序(游戏)时不许穿越(2026-10-22 用户要求)
+# ===========================================================================
+
+class TestGameBlocksCrossing:
+    """前台是别的进程的全屏窗口时, 主机不得进入穿越态。
+
+    用户原话: "主机在游戏中鼠标还是能穿梭到副机上。我需要游戏中这种情况时
+    主机的鼠标靠近边缘也不要穿梭。" 游戏里鼠标经常贴边平移, 一穿过去
+    键鼠就全跑到对面。
+    """
+
+    def _srv(self):
+        s = object.__new__(Server)
+        s._game_check = (False, 0.0)
+        s._game_blocks = 0
+        s._game_log_mono = 0.0
+        return s
+
+    def test_blocks_when_foreground_is_fullscreen(self, monkeypatch):
+        import com_bridge.cursor as cur
+        s = self._srv()
+        monkeypatch.setattr(cur, "foreign_fullscreen_foreground", lambda: True)
+        assert s._game_blocks_crossing() is True
+        assert s._game_blocks == 1
+
+    def test_allows_when_not_fullscreen(self, monkeypatch):
+        import com_bridge.cursor as cur
+        s = self._srv()
+        monkeypatch.setattr(cur, "foreign_fullscreen_foreground", lambda: False)
+        assert s._game_blocks_crossing() is False
+
+    def test_verdict_is_cached(self, monkeypatch):
+        """每个事件都查前台窗口太重: 结论必须在 TTL 内复用。"""
+        import com_bridge.cursor as cur
+        s = self._srv()
+        calls = []
+        monkeypatch.setattr(cur, "foreign_fullscreen_foreground",
+                            lambda: calls.append(1) or True)
+        for _ in range(50):
+            s._game_blocks_crossing()
+        assert len(calls) == 1, f"缓存失效: 查了 {len(calls)} 次"
+
+    def test_entry_is_gated_in_hot_path(self):
+        src = _strip_comments(inspect.getsource(Server._on_input_event))
+        i_game = src.index("_game_blocks_crossing()")
+        i_edge = src.index("self._edge.update(x, y)")
+        assert i_game < i_edge, "必须在抵边判定之前拦截"
+
+    def test_fullscreen_helper_exists(self):
+        from com_bridge.cursor import (foreign_fullscreen_foreground,
+                                       is_foreign_fullscreen)
+        assert callable(foreign_fullscreen_foreground)
+        assert callable(is_foreign_fullscreen)

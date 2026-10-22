@@ -197,9 +197,15 @@ class TestFullscreenGuard:
         assert "Progman" in _SHELL_CLASSES
         assert "WorkerW" in _SHELL_CLASSES
         import inspect
-        from com_bridge.cursor import CursorHider
-        src = inspect.getsource(CursorHider._is_foreign_fullscreen)
+        # 判定逻辑已抽到模块级函数(2026-10-22: 穿越拦截也要用同一套判据),
+        # 实例方法改为委托 —— 断言跟着挪到模块级函数上。
+        from com_bridge import cursor as cursor_mod
+        src = inspect.getsource(cursor_mod.is_foreign_fullscreen)
         assert "_SHELL_CLASSES" in src
+        # 实例方法必须走这条判据(不能各写一套)
+        from com_bridge.cursor import CursorHider
+        assert "is_foreign_fullscreen" in inspect.getsource(
+            CursorHider._is_foreign_fullscreen)
 
 
 # --- 源码级断言(防止有人把机制删掉/接错线) ------------------------------

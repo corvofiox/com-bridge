@@ -164,7 +164,7 @@ class Agent:
                  or os.path.exists(os.path.join(
                      os.environ.get("LOCALAPPDATA") or "", "ComBridge",
                      "diag_edge.flag")))
-    DIAG_MAX_LINES = 6000
+    DIAG_MAX_LINES = 50000
 
     def __init__(self, server_host: str | None = None, name: str = "agent",
                  mute_local: bool = True, discover_timeout_s: float = 3.0,
@@ -1191,6 +1191,10 @@ class Agent:
         """
         if self._diag_lines >= self.DIAG_MAX_LINES:
             return
+        now = time.monotonic()
+        if now - self._diag_edge_last < 0.004:      # 最多 250 行/秒
+            return
+        self._diag_edge_last = now
         self._diag_lines += 1
         after = get_cursor_pos()
         print(f"[agent][edge] inj dx={ev.a} dy={ev.b} "

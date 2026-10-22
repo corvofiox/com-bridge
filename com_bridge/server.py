@@ -183,6 +183,12 @@ class Server:
                      "diag_edge.flag")))
     DIAG_MAX_LINES = 20000
 
+    # ★ 全屏程序(游戏/播放器/远程桌面)在前台时**禁止穿越**(2026-10-22 用户要求):
+    #   "主机在游戏中鼠标还是能穿梭到副机上, 我需要游戏中主机的鼠标靠近边缘
+    #    也不要穿梭"。游戏里鼠标经常贴边平移, 一穿过去键鼠就全跑到对面。
+    #   判定结果缓存一会儿(每事件都查前台窗口太重), 见 _game_blocks_crossing。
+    GAME_BLOCK_CHECK_S = 0.2
+
     def __init__(self, name: str = "server", port: int = 24802,
                  jitter_ms: float = 60.0, side: str = "right",
                  bind_addr: str = "0.0.0.0", capture_local: bool = False,
@@ -255,6 +261,10 @@ class Server:
         # 边界现场取证的已输出行数与节流时刻(见 _diag_edge_event)
         self._diag_lines = 0
         self._diag_mono = 0.0
+        # 全屏程序抑制穿越: 缓存(结论, 检查时刻)与告警节流
+        self._game_check = (False, 0.0)
+        self._game_blocks = 0
+        self._game_log_mono = 0.0
         # 键盘钩子自愈(见 _kbd_heal_loop): 同一时刻只允许一轮在跑
         self._kbd_healing = False
         self._kbd_heal_lock = threading.Lock()
@@ -1475,6 +1485,30 @@ class Server:
             return 1e9
         return float(buf.max_ms) * 0.6
 
+    def _game_blocks_crossing(self) -> bool:
+        """前台是不是"别的进程的全屏程序"(游戏/播放器/远程桌面)。
+
+        是的话本机**不进入穿越态**: 用户在游戏里把鼠标推到屏幕边不应把键鼠
+        交给副电脑。结果缓存 `GAME_BLOCK_CHECK_S`, 避免每个事件都查窗口。
+        """
+        now = time.monotonic()
+        verdict, ts = self._game_check
+        if now - ts < self.GAME_BLOCK_CHECK_S:
+            return verdict
+        try:
+            from .cursor import foreign_fullscreen_foreground
+            verdict = bool(foreign_fullscreen_foreground())
+        except Exception:  # noqa: BLE001
+            verdict = False
+        self._game_check = (verdict, now)
+        if verdict:
+            self._game_blocks += 1
+            if now - self._game_log_mono >= 5.0:
+                self._game_log_mono = now
+                print("[server] 前台是全屏程序 -> 本次不穿越"
+                      f"(累计拦截 {self._game_blocks} 次)", flush=True)
+        return verdict
+
     def _diag_edge_event(self, ev: InputEvent) -> None:
         """边界现场取证(COM_BRIDGE_DIAG_EDGE / diag_edge.flag 时开启)。
 
@@ -1588,6 +1622,11 @@ class Server:
                 #   事件就会走进穿越分支, 表现为光标莫名跳到对面。
                 if not pushing_out:
                     self._edge.reset()      # 朝内移动: 连"抵边计数"也清零
+                    return
+                # ★ 前台是全屏程序(游戏/播放器/远程桌面)时不许穿越:
+                #   放在"抵边计数"之前, 连计数都不累, 退出游戏后从干净状态开始。
+                if self._game_blocks_crossing():
+                    self._edge.reset()
                     return
                 x, y = get_cursor_pos()
                 if self._edge.update(x, y):
