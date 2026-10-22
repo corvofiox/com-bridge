@@ -405,3 +405,48 @@ def _is_outside_never_happened(feed) -> bool:
             return False
     return True
 
+
+# ===========================================================================
+# 6. 诊断绝不能改变行为(2026-10-22 事故: 一进副机指针就卡死)
+# ===========================================================================
+
+class TestDiagNeverChangesBehavior:
+    """诊断开关开启时, 注入行为必须与关闭时**完全一致**。
+
+    事故现场: `_diag_inject` 在行数配额(6000)用满后直接 `return`, 而调用方
+    是"命中诊断就交给它, 由它内部注入" —— 于是配额一满, **边缘附近的所有
+    位移被静默丢弃**。1000 事件/秒下 6000 行只需几秒, 所以每次重启后边缘
+    只正常几秒; 用户看到的是"一进副机指针就卡死不动", 只能按 Ctrl+Alt+Esc
+    逃出来(日志里 4 次逃生键)。
+    """
+
+    def test_moves_still_injected_when_diag_capped(self, agent_at_edge,
+                                                   monkeypatch):
+        a = agent_at_edge
+        monkeypatch.setattr(Agent, "DIAG_EDGE", True)
+        a._diag_lines = Agent.DIAG_MAX_LINES        # 配额已满
+        a._on_input_event(_move(7))
+        assert a._injected_moves == [(7, 0)], "诊断配额用满后位移仍必须注入"
+
+    def test_moves_still_injected_when_diag_on(self, agent_at_edge,
+                                               monkeypatch):
+        a = agent_at_edge
+        monkeypatch.setattr(Agent, "DIAG_EDGE", True)
+        a._on_input_event(_move(7))
+        assert a._injected_moves == [(7, 0)], "开启诊断时也必须注入"
+
+    def test_log_helper_never_touches_cursor(self, agent_at_edge,
+                                             monkeypatch, capsys):
+        a = agent_at_edge
+        a._diag_log_inject(_move(5), (0, 800))
+        assert a._injected_moves == [], "日志函数不得改动光标"
+        assert "inj dx=5" in capsys.readouterr().out
+
+    def test_no_diag_call_site_injects(self):
+        """源码约定: 注入与诊断必须是两条独立语句(顺序: 注入在前)。"""
+        src = _strip_comments(inspect.getsource(Agent._on_input_event))
+        i_inj = src.index("inj.move_relative(ev.a, ev.b)")
+        i_diag = src.index("_diag_log_inject(ev, diag_before)")
+        assert i_inj < i_diag, "必须先注入再记日志"
+        assert "_diag_inject(" not in src, "旧的'诊断内部注入'写法必须消失"
+

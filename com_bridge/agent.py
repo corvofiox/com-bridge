@@ -1077,10 +1077,21 @@ class Agent:
                     if self.DIAG_EDGE:
                         self._diag_edge("toward", x, y, ev, 0)
             if ev.type == EV_MOUSE_MOVE_REL:
-                if self.DIAG_EDGE and self._diag_near():
-                    self._diag_inject(ev)      # 诊断会在内部完成注入
-                else:
-                    inj.move_relative(ev.a, ev.b)
+                # ★★★ 诊断**只旁听, 绝不替代注入**(2026-10-22 事故):
+                #   上一版写成"命中诊断就交给 _diag_inject, 由它在内部注入",
+                #   而那个函数在行数用满后直接 return —— 于是**边缘附近的所有
+                #   位移被静默丢弃**: 用户看到的正是"一进副机指针就卡死不动",
+                #   而且从日志看 6000 行的配额在 1000 事件/秒下几秒就用完了,
+                #   所以每次重启后边缘只正常几秒。
+                #   现在: 先把位置读出来(诊断用), 再**无条件**注入, 最后才记日志。
+                diag_before = None
+                if (self.DIAG_EDGE
+                        and self._diag_lines < self.DIAG_MAX_LINES
+                        and self._diag_near()):
+                    diag_before = get_cursor_pos()
+                inj.move_relative(ev.a, ev.b)
+                if diag_before is not None:
+                    self._diag_log_inject(ev, diag_before)
             elif ev.type == EV_MOUSE_BUTTON:
                 down = bool(ev.flags & MB_DOWN)
                 inj.button(ev.code, down)
@@ -1171,25 +1182,23 @@ class Agent:
             return y - r.top <= 160
         return r.bottom - 1 - y <= 160
 
-    def _diag_inject(self, ev) -> None:
-        """诊断: 记录**注入前后光标实际在哪**, 用来证明位移有没有生效。
+    def _diag_log_inject(self, ev, before) -> None:
+        """诊断: 记录**注入前后光标实际在哪**(只记日志, 不做注入)。
 
-        现场问题: "光标在副机边缘附近时, 朝屏内(右)慢慢移动, 指针离不开
-        边缘; 用力拉才行"。这条日志能直接分出两种情况:
-          * `(24,800) -> (25,800)`  —— 注入生效, 是别的东西把指针又拉回去;
-          * `(24,800) -> (24,800)`  —— 注入没生效(或坐标被系统吃掉)。
+        ★ 调用方必须已经完成注入 —— 本函数**永远不碰光标**, 它挂在输入
+        热路径上, 一旦在这里做条件分支就会改变行为(上一版就是这么把整个
+        副机的鼠标卡死的: 行数用满后连注入一起跳过)。
         """
         if self._diag_lines >= self.DIAG_MAX_LINES:
             return
         self._diag_lines += 1
-        before = get_cursor_pos()
-        InputInjector.move_relative(ev.a, ev.b)
         after = get_cursor_pos()
         print(f"[agent][edge] inj dx={ev.a} dy={ev.b} "
               f"({before[0]},{before[1]}) -> ({after[0]},{after[1]})",
               flush=True)
         if self._diag_lines >= self.DIAG_MAX_LINES:
-            print("[agent][edge] !! 诊断行数已满, 停止记录", flush=True)
+            print("[agent][edge] !! 诊断行数已满, 停止记录(注入不受影响)",
+                  flush=True)
 
     def _diag_edge(self, tag: str, x: int, y: int, ev, acc: int = 0) -> None:
         """COM_BRIDGE_DIAG_EDGE 时的现场取证输出(节流 20Hz)。
