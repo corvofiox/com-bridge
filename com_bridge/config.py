@@ -39,6 +39,11 @@ _DEFAULTS = {
     "last_exit": 0.0,
     # 界面配色: auto(跟随 Windows) | light | dark
     "ui_theme": "auto",
+    # 自动更新检查的缓存(见 update_check.py): 上次检查时刻(epoch 秒)、
+    # 查到的最新版本号与页面地址。用配置做缓存, 重开窗口不会重复请求。
+    "update_checked_at": 0.0,
+    "update_latest": "",
+    "update_url": "",
 }
 
 

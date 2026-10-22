@@ -22,6 +22,7 @@ import traceback
 import tkinter as tk
 from tkinter import ttk
 
+from . import __version__ as _app_version
 from .agent import Agent, HostWaitCancelled
 from .clock import now_us
 from .server import Server
@@ -468,9 +469,13 @@ class ComBridgeGui:
         foot = tk.Frame(root, background=T.BG)
         foot.grid(row=3, column=0, sticky="ew", padx=T.PAGE_PAD,
                   pady=(T.sp(10), T.sp(12)))
-        tk.Label(foot, text="运行时最小化到托盘，关闭窗口不停止服务",
-                 background=T.BG, foreground=T.TEXT_FAINT,
-                 font=T.FONT_UI_TINY, padx=0).pack(side="left")
+        # ★ 这个标签有两个用途(审查项 #7): 平时显示提示语; 查到新版本后
+        #   变成可点击的"发现新版本 vX，点此下载 ↗"。
+        self._foot_hint = tk.Label(
+            foot, text="运行时最小化到托盘，关闭窗口不停止服务",
+            background=T.BG, foreground=T.TEXT_FAINT,
+            font=T.FONT_UI_TINY, padx=0)
+        self._foot_hint.pack(side="left")
 
         if not hasattr(self, "_status_win"):
             self._status_win = None
@@ -493,6 +498,51 @@ class ComBridgeGui:
         except tk.TclError:
             pass
         self.root.after(200, self._refresh_elev_state)
+
+        # 自动更新检查(审查项 #7): 后台查一次, 有新版本就把底栏提示换成
+        # 可点击的下载链接。只在**有新版本**时才动界面 —— 查不到
+        # (离线/限流/GitHub 不通)完全静默, 绝不在界面上留红字。
+        self._start_update_check()
+
+    # -- 自动更新检查 --------------------------------------------------
+
+    def _start_update_check(self) -> None:
+        """后台线程查一次更新(不阻塞界面, 失败静默)。"""
+        import threading
+
+        def run() -> None:
+            try:
+                from .update_check import check
+                info = check()
+            except Exception:                 # noqa: BLE001
+                return
+            if not info or not info.get("newer"):
+                return
+            try:
+                self.root.after(0, lambda: self._on_update_found(info))
+            except Exception:                 # noqa: BLE001
+                pass
+
+        threading.Thread(target=run, daemon=True, name="UpdateCheck").start()
+
+    def _on_update_found(self, info: dict) -> None:
+        """有新版本: 底栏换成可点击链接 + 写一行日志(不动主界面其它部分)。"""
+        ver = info.get("version") or "?"
+        url = info.get("url") or ""
+        try:
+            from . import ui_theme as T
+            self._foot_hint.configure(
+                text=f"发现新版本 v{ver}，点此下载 ↗",
+                foreground=T.ACCENT if hasattr(T, "ACCENT") else T.TEXT,
+                cursor="hand2")
+            if url:
+                self._foot_hint.bind(
+                    "<Button-1>",
+                    lambda _e: __import__("webbrowser").open(url))
+        except Exception:                     # noqa: BLE001
+            pass
+        self._log_q.put(
+            f"[gui] 发现新版本 v{ver}（当前 v{_app_version}）: {url}")
 
     # -- 布局小工具 ----------------------------------------------------
 
@@ -1468,6 +1518,7 @@ class ComBridgeGui:
                 out["clock"] = (
                     f"渲染比例 {rr:.6f} / 到达率 "
                     f"{role.stats.get('arrival_rate', 0):.0f} Hz", 1)
+            out["clipboard"] = self._clip_status(role)
         else:
             clock = (role._control.clock
                      if getattr(role, "_control", None) else None)
@@ -1499,7 +1550,57 @@ class ComBridgeGui:
                     f" ｜ 单调钟偏移 {clock.offset_us / 1000:+.0f}ms"
                     f"（两机开机时刻之差，换算用，不是时钟误差）",
                     1 if synced else 2)
+            out["clipboard"] = self._clip_status(role)
         return out
+
+    @staticmethod
+    def _clip_status(role) -> tuple[str, int]:
+        """状态窗口的"剪贴板"一行: 发/收计数 + 文件数 + 流量。
+
+        ★ 为什么需要(审查项 #5): 剪贴板是本程序的主力功能之一, 但它的
+          统计(发了几次、收了几个文件、多少 MB)以前**只存在于日志里**,
+          用户想知道"刚才那个 200MB 的文件夹到底传过去没有"只能翻日志。
+        """
+        tx = getattr(role, "_clip_tx", None)
+        rx = getattr(role, "_clip_rx", None)
+        sync = getattr(role, "_clip_sync", None)
+        if tx is None and rx is None:
+            return ("未启用", 0)
+        parts: list[str] = []
+        level = 1
+        if tx is not None:
+            st = tx.stats() if hasattr(tx, "stats") else {}
+            seg = f"发 {st.get('sent', 0)} 项"
+            if st.get("bytes_sent"):
+                seg += f" ({st['bytes_sent'] / 1048576:.1f} MB)"
+            if st.get("busy"):
+                seg += " · 传输中…"
+            if st.get("queued"):
+                seg += f" · 排队 {st['queued']}"
+            if st.get("cancelled"):
+                seg += f" · 取消 {st['cancelled']}"
+            if st.get("failed"):
+                seg += f" · !! 失败 {st['failed']}"
+                level = 3
+            parts.append(seg)
+        if rx is not None:
+            d = getattr(rx, "stats", {}) or {}
+            seg = f"收 {d.get('payloads', 0)} 项"
+            if d.get("files"):
+                seg += f"（文件 {d['files']} 个"
+                seg += f", {d.get('bytes', 0) / 1048576:.1f} MB）"
+            if d.get("rejected"):
+                seg += f" · !! 拒收 {d['rejected']}"
+                level = 3
+            parts.append(seg)
+        if sync is not None:
+            sd = getattr(sync, "stats", {}) or {}
+            if sd.get("skipped_big"):
+                parts.append(f"过大跳过 {sd['skipped_big']}")
+            if sd.get("errors"):
+                parts.append(f"!! 采集错误 {sd['errors']}")
+                level = max(level, 2)
+        return (" ｜ ".join(parts), level)
 
     def _update_stats(self, role: Server | Agent) -> None:
         """保留旧入口(兼容既有测试), 实际工作交给 collect_status。"""

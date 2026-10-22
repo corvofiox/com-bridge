@@ -122,7 +122,8 @@ class StatusWindow(_BaseWindow):
     """实时状态窗口: 分组卡片 + 一行一个指标(圆点 + 名称 + 数值)。"""
 
     title = "Com Bridge · 实时状态"
-    geometry = "720x560"
+    # 高度含"剪贴板"分组(0.4.7 起), 多一行 + 一个分组标题
+    geometry = "720x620"
 
     # (key, 分组标题, 显示名)
     FIELDS = (
@@ -132,6 +133,7 @@ class StatusWindow(_BaseWindow):
         ("input", "输入链路", "键鼠"),
         ("clock", "输入链路", "时钟"),
         ("hook", "输入链路", "键盘钩子"),
+        ("clipboard", "跨机功能", "剪贴板"),
     )
 
     _LEVEL_COLOR = {0: "#98A2B3", 1: "#12B76A", 2: "#F59E0B", 3: "#E5484D"}
