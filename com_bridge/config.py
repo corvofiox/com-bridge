@@ -56,7 +56,11 @@ def load() -> dict:
         path = config_path()
         if not os.path.exists(path):
             return cfg
-        with open(path, encoding="utf-8") as f:
+        # ★ 必须容 BOM(utf-8-sig): 用户用记事本 / PowerShell `Set-Content
+        #   -Encoding UTF8` 改过配置时, 文件开头会带 UTF-8 BOM, 而
+        #   `json.load` 遇到 BOM 直接抛 ValueError -> 整个配置退回默认值,
+        #   表现是"明明 was_running=true 却不自动连接"(2026-10-23 实测踩到)。
+        with open(path, encoding="utf-8-sig") as f:
             data = json.load(f)
         if not isinstance(data, dict):
             return cfg
