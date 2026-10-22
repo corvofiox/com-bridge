@@ -344,12 +344,16 @@ class TestLocalPointerDoesNotDriveHost:
 # 5. 慢推必须和快甩一样能过去(2026-10-22 "慢移离不开边缘"的根因回归)
 # ===========================================================================
 
-class TestSlowPushEntry:
-    """主机侧进入判定: confirm_frames=2 + "dx<=0 就清零" 会把慢推卡死。
+class TestEntryConfirmFrames:
+    """主机侧进入判定用 EdgeDetector 的默认帧数(2) —— 用户要求保留原手感。
 
-    鼠标按固定频率上报, 慢慢移动时绝大多数报告是 dx=0(位移不足一个计数),
-    夹着偶尔的 dx=+1。旧实现要求"连续 2 帧外向", 而 dx=0 会把 streak 清零,
-    于是慢推几十秒都过不去; 快甩是一连串大 dx, 立刻满足。
+    2026-10-22 曾临时改成 1, 以为"慢推进不了副机"卡在这个帧数上; 真正的原因是
+    注入坐标归一化在宽桌面上丢像素(见 tests/test_injection_roundtrip.py), 归一化
+    修好后按用户要求改回默认值。
+
+    ⚠ 已知取舍(下面第二条测试就是它的模型): 要求"连续 2 帧外向", 而 dx<=0 的
+    事件(含 dx=0 的静止/纯竖直上报)会把计数清零, 所以**极慢**的推法可能需要
+    稍微果断一点; 用户认可当前手感, 不再为此调参。
     """
 
     def _model(self, confirm_frames: int):
@@ -366,44 +370,26 @@ class TestSlowPushEntry:
 
         return edge, feed
 
-    def test_slow_push_crosses_with_single_frame(self):
-        edge, feed = self._model(1)
-        crossed = False
-        for _ in range(20):                     # 慢推: 每 10 个上报才有 1 个 +1
-            for _ in range(9):
-                crossed = feed(0) or crossed
-            crossed = feed(1) or crossed
-            if crossed:
-                break
-        assert crossed, "慢推(夹着 dx=0 上报)必须能进穿越态"
+    def test_fast_flick_crosses_with_default_frames(self):
+        edge, feed = self._model(2)
+        assert any(feed(30) for _ in range(2)), "快甩必须立刻过去"
 
-    def test_slow_push_stalls_with_two_frames(self):
-        _, feed = self._model(2)
-        for _ in range(20):
-            for _ in range(9):
-                feed(0)
-            if feed(1):
-                break
-        assert _is_outside_never_happened(feed), "这是旧 bug 的模型: 慢推永远进不去"
+    def test_adjacent_outward_reports_needed(self):
+        """连续 2 个外向上报就够(正常手速); 中间夹 dx=0 会重新计数。"""
+        edge, feed = self._model(2)
+        assert feed(3) is False          # 第 1 帧
+        assert feed(4) is True           # 第 2 帧 -> 进穿越态
+        # 夹了 dx=0 就得重新来
+        edge.reset()
+        assert feed(3) is False
+        feed(0)
+        assert feed(4) is False, "被 dx=0 清零后必须重新累计"
+        assert feed(5) is True
 
-    def test_fast_flick_works_either_way(self):
-        for n in (1, 2):
-            _, feed = self._model(n)
-            assert any(feed(30) for _ in range(2)), "快甩必须立刻过去"
-
-    def test_server_uses_single_confirm_frame(self):
+    def test_server_uses_detector_default(self):
+        """不得在 Server._start_input 里自定义 confirm_frames(保持默认 2)。"""
         src = inspect.getsource(Server._start_input)
-        assert "confirm_frames=1" in src, \
-            "主机侧进入判定必须与回传侧对称(一击即过)"
-
-
-def _is_outside_never_happened(feed) -> bool:
-    """上面的 2 帧模型跑完后, 探测器从未进入过 outside。"""
-    # 模型里 feed() 的返回值恒为 False; 这里再喂一串 dx=0 确认不会突然成立
-    for _ in range(50):
-        if feed(0):
-            return False
-    return True
+        assert "confirm_frames" not in src,             "进入判定应使用 EdgeDetector 默认帧数, 不要再塞临时的 1"
 
 
 # ===========================================================================
