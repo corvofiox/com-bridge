@@ -562,6 +562,11 @@ class Server:
         monitors = enumerate_monitors()
         if not monitors:
             raise RuntimeError("未枚举到显示器")
+        # ★★★ 越界判定的基准必须是**整个虚拟桌面**, 不是"面积最大的那块屏"。
+        #   2026-10-23 审查发现: 主机接两块屏时, 用单块屏判定会让越界边落在
+        #   **那块屏自己的边缘** —— 两块屏并排时那条边正好在桌面中间, 光标
+        #   走到中间就判"越界"把输入送去副机。副机侧一直用 virtual_desktop(),
+        #   两侧必须同一口径。self_mon 只留作日志(说明本机有哪些屏)。
         self_mon = max(monitors, key=lambda r: r.width * r.height)
         # ★ 进入判定的帧数用 EdgeDetector 的默认值(2), 与用户认可的手感一致。
         #   2026-10-22 曾临时改成 1(以为"慢推进不了副机"卡在这个帧数上), 但真正的
@@ -570,8 +575,14 @@ class Server:
         #   ⚠ 已知取舍: 要求"连续 2 帧外向", 而 dx<=0 的事件(含 dx=0 的静止/纯
         #   竖直上报)会把计数清零, 所以**极慢**的推法可能需要稍微果断一点。
         self._edge = EdgeDetector(
-            self_rect=self_mon, peer_rect=ScreenRect(0, 0, 0, 0), side=self.side
+            self_rect=virtual_desktop(), peer_rect=ScreenRect(0, 0, 0, 0),
+            side=self.side
         )
+        _vd = self._edge.self_rect
+        if len(monitors) > 1:
+            print(f"[server] 多显示器: 越界基准=整个虚拟桌面 "
+                  f"{_vd.width}x{_vd.height} (共 {len(monitors)} 块屏), "
+                  f"越界边={self.side}", flush=True)
         # 接收 agent 回传的输入事件(光标拖回主电脑时, 副电脑发事件过来)
         # ★ 同时用 on_heartbeat 做**NAT 打洞**: 收到副电脑的心跳时, 我们
         #   看到的是它**真实可用的源地址**(而 TCP accept 学到的是网关),
@@ -616,7 +627,11 @@ class Server:
         #   原因就是进程 DPI-unaware 导致坐标被系统虚拟化(高 DPI 副机上
         #   尤其明显)。把这两个数写进日志, 现场一眼就能判断"是不是这套
         #   坐标系"的问题, 不用再猜。
-        from .input import dpi_awareness, virtual_desktop
+        # ★ 只导入 dpi_awareness: virtual_desktop 已在**模块顶部**导入。
+        #   这里若再写一次, 它就会变成 _start_input 的局部名, 函数前面
+        #   使用它的那行会抛 UnboundLocalError(2026-10-23 实测踩到,
+        #   表现为主机 Server.start() 直接崩、副机一直等主机就绪)。
+        from .input import dpi_awareness
         _d = virtual_desktop()
         print(
             f"[server] 本机屏幕 {self_mon}; 越界边={self.side}; "

@@ -727,6 +727,8 @@ class CursorHider:
             self._physical_streak = 0
             self._shown = True
             return
+        # 诊断: 完整隐藏流程执行次数(幂等提前返回的那条路不计入)
+        self._hide_exec = getattr(self, "_hide_exec", 0) + 1
         user32.EnableWindow(self._hwnd, TRUE)
         user32.SetActiveWindow(self._hwnd)
         # 用 AttachThreadInput 强制抢前台(照搬 MSWindowsDesks.cpp :617-622)
@@ -779,6 +781,8 @@ class CursorHider:
         self._shown = True
 
     def _do_show(self) -> None:
+        # 诊断: 收起次数(与 _hide_exec 一起看, 突增 = hider 在反复抖动)
+        self._show_exec = getattr(self, "_show_exec", 0) + 1
         # ★ 先置 _shown=False 再 ReleaseCapture: 释放捕获可能触发
         #   WM_CAPTURECHANGED, 若那时 _shown 仍为 True, 重捕获逻辑会把
         #   捕获抢回来 -> 光标永远隐藏不掉(自己造的死锁)。

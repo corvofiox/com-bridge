@@ -164,6 +164,18 @@ class Agent:
                      "diag_edge.flag")))
     DIAG_MAX_LINES = 50000
 
+    # ★ 管线延迟报告(每 5 秒一行, 回答"到底是网络慢、注入慢, 还是我们在排队"):
+    #   打开方式(任选其一, 重启生效):
+    #     * 环境变量 COM_BRIDGE_DIAG_LAT=1
+    #     * 存在标记文件 %LOCALAPPDATA%\ComBridge\diag_lat.flag
+    #   为什么需要它: "副机某块屏移动迟滞"这种主观描述无法定位 —— 必须看到
+    #   (接收速率, 批深/合并数, 单批注入耗时, 光标所在屏) 四个量才能判断
+    #   是"系统/驱动注入慢"还是"我们在排队"。见 transport.coalesce_moves。
+    DIAG_LAT = (bool(os.environ.get("COM_BRIDGE_DIAG_LAT"))
+                or os.path.exists(os.path.join(
+                    os.environ.get("LOCALAPPDATA") or "", "ComBridge",
+                    "diag_lat.flag")))
+
     def __init__(self, server_host: str | None = None, name: str = "agent",
                  mute_local: bool = True, discover_timeout_s: float = 3.0,
                  prefer_rate: int = 48000, control_port: int | None = None,
@@ -227,6 +239,9 @@ class Agent:
         self._diag_edge_last = 0.0
         # 已发出的打洞心跳数(GUI 用它确认打洞在持续进行)
         self._punch_heartbeats = 0
+        # 延迟诊断线程(仅在 Agent.DIAG_LAT 时启动)
+        self._lat_stop = threading.Event()
+        self._lat_thread = None
         self._adv_host: str | None = None
         # 主电脑下发的方位(权威值; None = 旧版主机未下发, 退回本机配置)
         # 语义: 副电脑位于主电脑的哪一侧。见 _start_return 的长注释。
@@ -509,6 +524,73 @@ class Agent:
         )
         sync_thread.start()
         self._threads.append(sync_thread)
+
+        # 6. 管线延迟诊断(仅 DIAG_LAT 时; 只读计数, 不碰输入路径)
+        if self.DIAG_LAT:
+            self._lat_thread = threading.Thread(
+                target=self._lat_report_loop, daemon=True, name="AgentLatDiag")
+            self._lat_thread.start()
+            print(f"[agent] 管线延迟诊断已开启(5 秒一行); 关闭请删除 "
+                  f"%LOCALAPPDATA%\\ComBridge\\diag_lat.flag 并重启",
+                  flush=True)
+
+    def _lat_report_loop(self) -> None:
+        """每 5 秒打印一次输入管线的吞吐/积压/注入耗时 + 光标所在屏。
+
+        判读方法(时间顺序看几行就够):
+          * `接收` 远小于主机的鼠标上报率(常见 1000)而 `最大积压` 一直是 1
+            -> 事件在路上就丢了, 不是我们慢;
+          * `最大积压` 持续 > 1、`合并` 持续增长
+            -> 我们在排队, 但 coalesce_moves 已经把积压塌缩成一次注入,
+               主观迟滞应随之消失(这也是这次修复的验证点);
+          * `注入均/峰` 本身就是毫秒级
+            -> SendInput 在这块屏/这台机器上就慢, 属于系统或驱动层面;
+          * `hider` 的隐藏/收起次数在快速上涨
+            -> 是隐藏器在反复抖动抢前台, 与鼠标事件量无关。
+        """
+        interval = 5.0
+        last_ev = 0
+        last_deliv = 0
+        last_hide = 0
+        last_show = 0
+        last_t = time.monotonic()
+        while not self._lat_stop.wait(interval):
+            rx = self._input_rx
+            if rx is None:
+                continue
+            now = time.monotonic()
+            dt = max(1e-6, now - last_t)
+            last_t = now
+            try:
+                st = rx.stats()
+            except Exception:                     # noqa: BLE001
+                continue
+            rate = (st["events"] - last_ev) / dt
+            d_rate = (st["deliveries"] - last_deliv) / dt
+            last_ev = st["events"]
+            last_deliv = st["deliveries"]
+            hider = self._hider
+            h_exec = getattr(hider, "_hide_exec", 0) if hider else 0
+            s_exec = getattr(hider, "_show_exec", 0) if hider else 0
+            h_rate = (h_exec - last_hide) / dt
+            s_rate = (s_exec - last_show) / dt
+            last_hide, last_show = h_exec, s_exec
+            try:
+                pos = get_cursor_pos()
+                mon = ""
+                for r in enumerate_monitors():
+                    if r.left <= pos[0] < r.right and r.top <= pos[1] < r.bottom:
+                        mon = f"{r.width}x{r.height}@{r.left},{r.top}"
+                        break
+            except Exception:                     # noqa: BLE001
+                pos, mon = (0, 0), "?"
+            print(f"[agent][lat] 接收={rate:.0f}/s 交付={d_rate:.0f}/s "
+                  f"批={st['batches']} 最大积压={st['max_batch']} "
+                  f"合并={st['merged']} "
+                  f"注入均={st['inject_ms_avg']:.2f}ms "
+                  f"峰={st['inject_ms_max']:.1f}ms | 光标={pos} 屏={mon} "
+                  f"| hider 隐藏={h_rate:.1f}/s 收起={s_rate:.1f}/s "
+                  f"(累计 {h_exec}/{s_exec})", flush=True)
 
     def _capture_loop(self) -> None:
         assert self._cap is not None and self._audio_tx is not None
@@ -1648,6 +1730,7 @@ class Agent:
 
     def stop(self) -> None:
         self._stop.set()
+        self._lat_stop.set()
         disable_high_res_timer()
         for t in self._threads:
             t.join(timeout=2.0)

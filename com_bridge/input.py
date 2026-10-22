@@ -867,7 +867,11 @@ class RawInputListener(threading.Thread):
         }
 
     def _emit_mouse(self, rm: RAWMOUSE) -> None:
-        ts = time.monotonic_ns() // 1000
+        # ★ 时间戳改用 perf_counter 微秒时钟(clock.now_us):
+        #   time.monotonic_ns() 在 Windows 上分辨率只有 **15ms**(见 clock.now_us
+        #   的实测说明), 拿它算"事件从捕获到注入花了多久"会被量化误差淹没。
+        from .clock import now_us
+        ts = now_us()
         if rm.usFlags & 0x01:  # MOUSE_MOVE_ABSOLUTE
             return
         if rm.lLastX or rm.lLastY:

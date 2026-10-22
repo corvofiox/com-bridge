@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import select
 import socket
 import struct
 import threading
@@ -25,6 +26,7 @@ from .protocol import (
     CONTROL_PORT,
     DISCOVERY_PORT,
     EV_HEARTBEAT,
+    EV_MOUSE_MOVE_REL,
     HEARTBEAT_SIZE,
     INPUT_PORT,
     INPUT_HEADER_SIZE,
@@ -515,6 +517,40 @@ class HeartbeatSender(threading.Thread):
         self._stop.set()
 
 
+def coalesce_moves(events: list) -> list:
+    """把**相邻**的 EV_MOUSE_MOVE_REL 合并成一条(顺序不变, 落点等价)。
+
+    ★ 为什么必须合并(2026-10-23 用户实测"副机 2560x1600 屏移动非常迟滞,
+      手停了光标还在追"):
+
+      输入是 UDP, 消费端一时跟不上时, 事件会堆在 socket 接收缓冲里
+      (默认 64KB ≈ 3400 条 19 字节事件 ≈ 3 秒)。旧实现逐条取出逐条注入,
+      于是**每一条都要付一次 SendInput 的代价**, 积压只能以"消费速率"缓慢
+      排空 —— 主观上就是"光标在追手", 而且越落后的那几秒越明显。
+
+      但光标只需要**最终位置**: k 条相邻位移等价于 1 条 (Σdx, Σdy)。
+      合并后一轮只注入一次, 积压立刻塌缩到最新位置。
+
+    ★ 只合并**相邻**的移动事件, 绝不跨越按键/滚轮/换边事件 —— 否则
+      [移动, 点击, 移动] 会被压成一次移动, 点击的落点就错了(顺序即语义)。
+    ★ 时间戳取合并链里**最后**一条(它才代表这个落点对应的时刻)。
+    """
+    if len(events) < 2:
+        return events
+    out: list = []
+    for ev in events:
+        if (ev.type == EV_MOUSE_MOVE_REL and out
+                and out[-1].type == EV_MOUSE_MOVE_REL):
+            prev = out[-1]
+            out[-1] = InputEvent(
+                EV_MOUSE_MOVE_REL, prev.flags, prev.code,
+                prev.a + ev.a, prev.b + ev.b, ev.ts_us,
+            )
+        else:
+            out.append(ev)
+    return out
+
+
 class InputReceiver(_BoundThread):
     """收输入事件的 UDP 监听(server 收回传事件, agent 收转发事件)。
 
@@ -545,6 +581,15 @@ class InputReceiver(_BoundThread):
         self.sent_events = 0
         self.send_failed = 0
         self.last_send_error: str | None = None
+        # ★ 积压合并的统计(见 coalesce_moves 的说明): 用来证明"到底有没有
+        #   积压" —— 合并次数多说明消费端确实跟不上, 光看代码是看不出来的。
+        self.batches = 0          # 实际交付的批数(一次 flush 算一批)
+        self.max_batch = 0        # 观察到的最深积压(批内事件数)
+        self.merged_events = 0    # 被合并掉的移动事件数
+        self.deliveries = 0       # 实际回调次数(= 注入次数)
+        self.inject_s_total = 0.0 # 回调总耗时(含注入)
+        self.inject_s_max = 0.0   # 单批回调最长耗时
+        self._pending: list = []  # 正在攒的批(只在本线程读写)
         # ★ 最近一次收到对端心跳的单调时间(按键卡死防护的判断依据:
         #   对端失联时, 之前转发来的按键可能永远等不到 up)
         self.last_heartbeat_mono: float | None = None
@@ -560,6 +605,9 @@ class InputReceiver(_BoundThread):
             try:
                 data, addr = s.recvfrom(2048)
             except (socket.timeout, TimeoutError):
+                # ★ 流一停就把攒着的那批交付掉: 否则批尾的最后几条要等到
+                #   **下一条事件**到来才生效(最多迟一个超时 = 0.5s)。
+                self._flush()
                 continue
             except OSError:
                 break
@@ -597,10 +645,50 @@ class InputReceiver(_BoundThread):
                 self.bad_packets += 1
                 continue
             self.events += 1
-            if self._on_event is not None:
-                try:
-                    self._on_event(ev)
-                except Exception as exc:  # noqa: BLE001
+            self._push_incoming(ev)
+
+    # 单批最多攒多少条事件(防止在持续高负载下无限期留在"攒批"状态)
+    MAX_DRAIN = 64
+
+    def _push_incoming(self, ev) -> None:
+        """收下一条事件; 若 socket 里还有积压就继续攒, 否则立刻交付。
+
+        ★ 用 `select(..., 0)` 探测积压, **不改 socket 超时模式** ——
+          改成非阻塞再改回来会在异常路径上留下"永久非阻塞"的隐患
+          (那样 recvfrom 会立刻抛 BlockingIOError, 接收线程空转)。
+        """
+        self._pending.append(ev)
+        s = self._sock
+        if s is None:
+            return self._flush()
+        if len(self._pending) < self.MAX_DRAIN:
+            try:
+                ready, _, _ = select.select([s], [], [], 0)
+            except OSError:
+                ready = []
+            if ready:
+                return          # 还有积压: 攒着, 下次进来接着攒
+        self._flush()
+
+    def _flush(self) -> None:
+        """把攒下的一批事件合并后交付(见 coalesce_moves)。"""
+        if not self._pending:
+            return
+        batch = self._pending
+        self._pending = []
+        self.batches += 1
+        if len(batch) > self.max_batch:
+            self.max_batch = len(batch)
+        merged = coalesce_moves(batch)
+        self.merged_events += len(batch) - len(merged)
+        if self._on_event is None:
+            return
+        t0 = time.perf_counter()
+        for ev in merged:
+            self.deliveries += 1
+            try:
+                self._on_event(ev)
+            except Exception as exc:  # noqa: BLE001
                     # ★★★ 回调异常必须**可见**(用户实测的隐性失效):
                     #
                     #   这里原来是 `except Exception: pass` —— 于是
@@ -618,6 +706,24 @@ class InputReceiver(_BoundThread):
                                   f"{type(exc).__name__}: {exc}", flush=True)
                         except Exception:  # noqa: BLE001
                             pass
+        dt = time.perf_counter() - t0
+        self.inject_s_total += dt
+        if dt > self.inject_s_max:
+            self.inject_s_max = dt
+
+    def stats(self) -> dict:
+        """积压/开销统计(诊断用, 不进热路径)。"""
+        avg_ms = (self.inject_s_total / self.deliveries * 1000.0
+                  if self.deliveries else 0.0)
+        return {
+            "events": self.events,
+            "deliveries": self.deliveries,
+            "batches": self.batches,
+            "max_batch": self.max_batch,
+            "merged": self.merged_events,
+            "inject_ms_avg": avg_ms,
+            "inject_ms_max": self.inject_s_max * 1000.0,
+        }
 
     def diag(self) -> dict:
         return {
