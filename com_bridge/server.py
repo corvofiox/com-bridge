@@ -554,7 +554,26 @@ class Server:
             raise RuntimeError("未枚举到显示器")
         self_mon = max(monitors, key=lambda r: r.width * r.height)
         self._edge = EdgeDetector(
-            self_rect=self_mon, peer_rect=ScreenRect(0, 0, 0, 0), side=self.side
+            self_rect=self_mon, peer_rect=ScreenRect(0, 0, 0, 0), side=self.side,
+            # ★★★ confirm_frames=1(2026-10-22 修。用户实测: "光标在副机靠主机
+            #   那一侧的边缘附近, 往副机里慢慢移动离不开边缘, 用力拉才行")。
+            #
+            #   旧值 2 的含义是"光标连续 2 帧抵边才进穿越态"。问题在于
+            #   `_on_input_event` 只在 `_is_outward(dx) > 0` 时才喂 EdgeDetector,
+            #   而**任何 dx<=0 的事件都会把 streak 清零**(包括纯竖直移动的
+            #   dx=0 报告)。鼠标按固定频率上报, 慢慢移动时绝大多数报告都是
+            #   dx=0(位移不足一个计数), 夹着偶尔的 dx=+1 —— 于是"连续两个
+            #   外向帧"极难凑齐:
+            #     快甩: 一连串 dx=+20..+100 -> 立刻满足, 瞬间过去;
+            #     慢移: +1 之后隔着几十个 dx=0 -> streak 反复归零, 几十秒都过不去。
+            #   实测(主机日志): 回程 17:38:19.998 -> 越界 17:38:20.255 (0.25s),
+            #   而回程 17:39:11.273 -> 越界 17:40:07.097 (**55.8 秒**),
+            #   同样是 12px 的边界、同一个人。副机回传侧一直是 confirm_frames=1,
+            #   所以"往主机走一碰就走"正常, 只有"往副机里走"发涩 —— 与用户
+            #   描述完全一致。
+            #   改成 1 后与回传侧对称: 光标真的抵到最外几列 + 一次外向位移,
+            #   立刻过去。
+            confirm_frames=1,
         )
         # 接收 agent 回传的输入事件(光标拖回主电脑时, 副电脑发事件过来)
         # ★ 同时用 on_heartbeat 做**NAT 打洞**: 收到副电脑的心跳时, 我们

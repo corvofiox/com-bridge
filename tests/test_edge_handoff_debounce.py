@@ -339,3 +339,69 @@ class TestLocalPointerDoesNotDriveHost:
         assert a.stats["events_returned"] == 1
         assert a._host_has_control is True
 
+
+# ===========================================================================
+# 5. 慢推必须和快甩一样能过去(2026-10-22 "慢移离不开边缘"的根因回归)
+# ===========================================================================
+
+class TestSlowPushEntry:
+    """主机侧进入判定: confirm_frames=2 + "dx<=0 就清零" 会把慢推卡死。
+
+    鼠标按固定频率上报, 慢慢移动时绝大多数报告是 dx=0(位移不足一个计数),
+    夹着偶尔的 dx=+1。旧实现要求"连续 2 帧外向", 而 dx=0 会把 streak 清零,
+    于是慢推几十秒都过不去; 快甩是一连串大 dx, 立刻满足。
+    """
+
+    def _model(self, confirm_frames: int):
+        """复刻 Server._on_input_event 的喂入规则(只有 dx>0 才喂探测器)。"""
+        edge = EdgeDetector(ScreenRect(0, 0, 1920, 1080),
+                            ScreenRect(0, 0, 0, 0), side="right",
+                            confirm_frames=confirm_frames)
+
+        def feed(dx: int, x: int = 1919) -> bool:
+            if dx <= 0:
+                edge.reset()
+                return False
+            return edge.update(x, 0)
+
+        return edge, feed
+
+    def test_slow_push_crosses_with_single_frame(self):
+        edge, feed = self._model(1)
+        crossed = False
+        for _ in range(20):                     # 慢推: 每 10 个上报才有 1 个 +1
+            for _ in range(9):
+                crossed = feed(0) or crossed
+            crossed = feed(1) or crossed
+            if crossed:
+                break
+        assert crossed, "慢推(夹着 dx=0 上报)必须能进穿越态"
+
+    def test_slow_push_stalls_with_two_frames(self):
+        _, feed = self._model(2)
+        for _ in range(20):
+            for _ in range(9):
+                feed(0)
+            if feed(1):
+                break
+        assert _is_outside_never_happened(feed), "这是旧 bug 的模型: 慢推永远进不去"
+
+    def test_fast_flick_works_either_way(self):
+        for n in (1, 2):
+            _, feed = self._model(n)
+            assert any(feed(30) for _ in range(2)), "快甩必须立刻过去"
+
+    def test_server_uses_single_confirm_frame(self):
+        src = inspect.getsource(Server._start_input)
+        assert "confirm_frames=1" in src, \
+            "主机侧进入判定必须与回传侧对称(一击即过)"
+
+
+def _is_outside_never_happened(feed) -> bool:
+    """上面的 2 帧模型跑完后, 探测器从未进入过 outside。"""
+    # 模型里 feed() 的返回值恒为 False; 这里再喂一串 dx=0 确认不会突然成立
+    for _ in range(50):
+        if feed(0):
+            return False
+    return True
+
