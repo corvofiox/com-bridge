@@ -85,5 +85,41 @@ def test_collect_sync_errors_raise_warning_level():
     assert "采集错误 2" in text and level == 2
 
 
+def test_status_window_has_the_clipboard_field():
+    """字段表里必须有这一行, 且分组/显示名固定(否则界面上找不到)。"""
+    from com_bridge import gui_windows as gw
+    assert ("clipboard", "跨机功能", "剪贴板") in gw.StatusWindow.FIELDS
+
+
+def test_status_window_renders_clipboard_row():
+    """真渲染一遍状态窗口(离屏), 确认这一行拿到的是数据而不是"—"。"""
+    import queue
+    import tkinter as tk
+
+    from com_bridge import gui_windows as gw
+
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无图形环境")
+    root.withdraw()                    # 不显示任何窗口
+
+    class App:
+        _log_q = queue.Queue()
+
+        def collect_status(self):
+            return {"clipboard": ("发 1 项 (0.5 MB) ｜ 收 2 项（文件 1 个, 3.0 MB）", 1)}
+
+    try:
+        win = gw.StatusWindow(root, App())
+        win._create()                  # 与运行时同一份构建代码
+        assert "clipboard" in win._rows, "状态窗口没渲染出剪贴板这一行"
+        text = win._rows["clipboard"].cget("text")
+        assert "发 1 项" in text and "文件 1 个" in text
+        win.destroy()
+    finally:
+        root.destroy()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
