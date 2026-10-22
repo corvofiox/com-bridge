@@ -60,24 +60,51 @@ def _old_norm(v: int, origin: int, span: int) -> int:
     return int((v - origin) * 65535 / max(1, span))
 
 
-class TestNormalizationMatchesDeskflow:
+class TestNormalizationIsExactInverse:
+    """★ 2026-10-23 改: 归一化不再"照搬 Deskflow", 而是**Windows 反变换的精确逆**。
+
+    实测反推(1920 宽的屏上逐个定点值验证): Windows 把 ABSOLUTE 值还原成
+    像素用的是 `px = floor(val * extent / 65536)`。
+
+    旧公式(Deskflow 的 `round(65535 * x / (w-1))`)在 1920 宽的屏上只错 7 个
+    像素, 但在副机 **4480x1600** 桌面上错 **39 个** —— 相邻像素压到同一个
+    定点值, 于是 `move_relative` 读 14、目标 15、落回 14,**永远原地不动**。
+    真机日志拍到 `inj dx=1 (14,771) -> (14,771)` 连续几十条、钉了 1.5 秒,
+    这就是用户从第一版起报的"边缘粘滞"。详见 tests/test_injection_roundtrip.py。
+
+    因此这里断言的性质从"等于 Deskflow 公式"换成"往返无损"。
+    """
+
     RECT = ScreenRect(0, 0, 1920, 1080)
+
+    @staticmethod
+    def _win_px(val: int, extent: int) -> int:
+        """Windows 的反变换(实测反推)。"""
+        return (val * extent) // 65536
 
     @pytest.mark.parametrize("x", [0, 1, 500, 959, 960, 1918, 1919])
     @pytest.mark.parametrize("y", [0, 1, 539, 540, 1078, 1079])
-    def test_exact_deskflow_formula(self, monkeypatch, x, y):
+    def test_roundtrip_is_lossless(self, monkeypatch, x, y):
         ax, ay, flags = _capture_norm(monkeypatch, self.RECT, x, y)
-        assert ax == _deskflow_norm(x, self.RECT.left, self.RECT.width)
-        assert ay == _deskflow_norm(y, self.RECT.top, self.RECT.height)
         assert flags == (MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE
                          | MOUSEEVENTF_VIRTUALDESK)
+        assert self._win_px(ax, self.RECT.width) == x
+        assert self._win_px(ay, self.RECT.height) == y
 
-    def test_edge_pixel_gets_full_scale(self, monkeypatch):
-        """最右/最下可达像素必须映射到满量程 65535(不能差一截)。"""
+    def test_every_pixel_of_4480_roundtrips(self, monkeypatch):
+        """副机那块 4480 宽的桌面: 每一个像素都必须能落回原位。"""
+        rect = ScreenRect(0, 0, 4480, 1600)
+        monkeypatch.setattr(input_mod, "_virtual_screen", lambda: rect)
+        for x in (12, 13, 14, 15, 16, 100, 2239, 4478, 4479):
+            val = InputInjector.to_absolute(x, 0, rect.width)
+            assert self._win_px(val, rect.width) == x, f"x={x} 落不回原处"
+
+    def test_edge_pixel_reaches_edge(self, monkeypatch):
+        """最右/最下可达像素必须真的到达 1919/1079(不必等于 65535)。"""
         ax, _, _ = _capture_norm(monkeypatch, self.RECT, 1919, 0)
-        assert ax == 65535, f"右边缘应映射到 65535, 实际 {ax}"
+        assert self._win_px(ax, self.RECT.width) == 1919
         _, ay, _ = _capture_norm(monkeypatch, self.RECT, 0, 1079)
-        assert ay == 65535, f"下边缘应映射到 65535, 实际 {ay}"
+        assert self._win_px(ay, self.RECT.height) == 1079
 
     def test_zero_origin_offset(self, monkeypatch):
         rect = ScreenRect(-1920, 0, 0, 1080)   # 副屏在主屏左侧的多屏布局

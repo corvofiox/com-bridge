@@ -1074,20 +1074,50 @@ class InputInjector:
         return InputInjector.move_absolute(nx, ny)
 
     @staticmethod
+    def to_absolute(pos: int, origin: int, extent: int) -> int:
+        """像素坐标 -> MOUSEEVENTF_ABSOLUTE 的 0..65535 定点值。
+
+        ★★★ 必须与 Windows 的**反变换严格互逆**(2026-10-23 实测反推)。
+
+        Windows 把定点值还原成像素用的是
+            px = floor(val * extent / 65536)
+        实测(W=1920, 逐个对齐):
+
+            val=  100 -> x=   2   floor(100*1920/65536)=2       ✅
+            val= 3400 -> x=  99   floor(3400*1920/65536)=99      ✅
+            val=60000 -> x=1757   floor(60000*1920/65536)=1757    ✅
+            val=65535 -> x=1919   floor(65535*1920/65536)=1919    ✅
+
+        所以正向必须**向上取整**:
+            val = ceil((pos - origin) * 65536 / extent)
+
+        早期写的是 `round(pos * 65535 / (extent - 1))`(照搬 Deskflow)。
+        在 1920 宽的屏上它恰好无损(误差比 1 个定点单位还小), 但在副机的
+        **4480x1600** 桌面上会把相邻像素压到同一个定点值 —— 目标是 x 却落
+        回 x-1:
+            x=13 -> val=190 -> floor(190*4480/65536)=12   (目标 13, 落回 12)
+            x=15 -> val=219 -> floor(219*4480/65536)=14   (目标 15, 落回 14)
+        于是 `move_relative` 读到 14、目标 15、落回 14 …… **永远原地不动**,
+        只有攒够较大位移(用户"用力拉一下")才跳到下一格。
+        真机日志(2026-10-23 00:33 副机)直接拍到连续几十条:
+            [agent][edge] inj dx=1 dy=0 (14,771) -> (14,771)
+        钉在 x=14 上整整 1.5 秒 —— 这就是用户从第一版起报的"边缘粘滞"。
+
+        反过来说: 只要正向是反变换的精确逆, 映射就是**幂等**的, 同一目标
+        反复注入落在同一像素, 不会像"除以 w 且截断"那样每次漂 1px。
+        """
+        if extent <= 1:
+            return 0
+        val = (pos - origin) * 65536
+        ax = -(-val // extent)              # 向上取整(避免了浮点)
+        return max(0, min(65535, ax))
+
+    @staticmethod
     def move_absolute(x: int, y: int) -> int:
         """返回 SendInput 实际注入的事件数(0 = 被系统拒绝), 便于诊断。"""
-        # ★ 归一化公式必须**照搬 Deskflow 的 deskMouseMove**:
-        #     dx = 65535 * x / (w - 1) + 0.5   (除以 w-1, 并且四舍五入)
-        #   之前写成 `int((x - left) * 65535 / w)` —— 除以 w 且截断, 每次
-        #   注入都**少 1px**(实测: 反复注入同一目标 (1919,540), 60 次后光标
-        #   落在 (1918,539))。单次无害, 但"钉住边缘"是**每个鼠标事件都重注入
-        #   一次**, 而且传的是读回来的当前坐标 —— 误差于是逐事件累积,
-        #   表现为用户实测的"主机光标沿右边缘一路向上爬, 最后停在右上角"
-        #   (y 每事件 -1px 一路到顶; x 因为每轮传常量右边缘所以稳在边上)。
-        #   除以 (w-1) 后映射是**幂等**的: 同一目标反复注入落在同一像素。
         v = _virtual_screen()
-        ax = int(65535.0 * (x - v.left) / max(1, v.width - 1) + 0.5)
-        ay = int(65535.0 * (y - v.top) / max(1, v.height - 1) + 0.5)
+        ax = InputInjector.to_absolute(x, v.left, v.width)
+        ay = InputInjector.to_absolute(y, v.top, v.height)
         i = INPUT(type=INPUT_MOUSE)
         i.union.mi.dx = ax
         i.union.mi.dy = ay
