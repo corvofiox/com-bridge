@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import threading
 import time
 
@@ -173,6 +174,15 @@ class Server:
     #   取 1.0s: 足够快地跟随焦点变化, 又不会在输入热路径上频繁注入探针。
     KBD_VERIFY_TTL_S = 1.0
 
+    # 边界现场取证开关(与 Agent 同一套): 环境变量 COM_BRIDGE_DIAG_EDGE=1
+    # 或存在标记文件 %LOCALAPPDATA%\ComBridge\diag_edge.flag。改完重启生效。
+    # 只为排"边缘附近指针不动"这类手感问题服务, 平时零开销。
+    DIAG_EDGE = (bool(os.environ.get("COM_BRIDGE_DIAG_EDGE"))
+                 or os.path.exists(os.path.join(
+                     os.environ.get("LOCALAPPDATA") or "", "ComBridge",
+                     "diag_edge.flag")))
+    DIAG_MAX_LINES = 6000
+
     def __init__(self, name: str = "server", port: int = 24802,
                  jitter_ms: float = 60.0, side: str = "right",
                  bind_addr: str = "0.0.0.0", capture_local: bool = False,
@@ -242,6 +252,8 @@ class Server:
         self._kbd_verify_thread: threading.Thread | None = None
         # 启动自检线程的锁: 探针会改全局计数, 两个并发探针会互相污染判据
         self._kbd_verify_lock = threading.Lock()
+        # 边界现场取证的已输出行数(见 _diag_edge_event)
+        self._diag_lines = 0
         # 键盘钩子自愈(见 _kbd_heal_loop): 同一时刻只允许一轮在跑
         self._kbd_healing = False
         self._kbd_heal_lock = threading.Lock()
@@ -1443,6 +1455,37 @@ class Server:
             return 1e9
         return float(buf.max_ms) * 0.6
 
+    def _diag_edge_event(self, ev: InputEvent) -> None:
+        """边界现场取证(COM_BRIDGE_DIAG_EDGE / diag_edge.flag 时开启)。
+
+        现场问题(2026-10-22): "副机光标在靠主机那一侧的边缘附近时, 朝屏内
+        慢慢移动离不开边缘, 用力拉才行"。要判断这到底是
+          ① 主机根本没把位移转发过去(判定/状态问题), 还是
+          ② 转发了但副机注不进去(注入问题),
+        就得看**主机这一侧**每个事件的原始位移与当时的真实光标位置。
+        这里只在光标距跨越边 60px 内记录, 并限制总行数, 平时零开销。
+        """
+        if not self.DIAG_EDGE or self._diag_lines >= self.DIAG_MAX_LINES:
+            return
+        x, y = get_cursor_pos()
+        r = self._edge.self_rect if self._edge is not None else None
+        if r is None:
+            return
+        side = self.side
+        if side == "right":
+            near = (r.right - 1 - x) <= 60
+        elif side == "left":
+            near = (x - r.left) <= 60
+        elif side == "top":
+            near = (y - r.top) <= 60
+        else:
+            near = (r.bottom - 1 - y) <= 60
+        if not near:
+            return
+        self._diag_lines += 1
+        print(f"[server][edge] dx={ev.a} dy={ev.b} 光标=({x},{y}) "
+              f"穿越={self._edge.is_outside}", flush=True)
+
     def _on_input_event(self, ev: InputEvent) -> None:
         """主电脑侧: 判定光标是否越界, 越界后把事件转发给副电脑。
 
@@ -1486,6 +1529,7 @@ class Server:
             return
 
         if ev.type == EV_MOUSE_MOVE_REL:
+            self._diag_edge_event(ev)
             dx, dy = ev.a, ev.b
             # ★★ 刚被强制交回(失联/桌面切换/用户逃生键)的冷静期内
             #   **不许**再进穿越态 —— 否则用户的手只要还贴着边往外推,
