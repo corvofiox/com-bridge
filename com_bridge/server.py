@@ -181,7 +181,7 @@ class Server:
                  or os.path.exists(os.path.join(
                      os.environ.get("LOCALAPPDATA") or "", "ComBridge",
                      "diag_edge.flag")))
-    DIAG_MAX_LINES = 6000
+    DIAG_MAX_LINES = 20000
 
     def __init__(self, name: str = "server", port: int = 24802,
                  jitter_ms: float = 60.0, side: str = "right",
@@ -252,8 +252,9 @@ class Server:
         self._kbd_verify_thread: threading.Thread | None = None
         # 启动自检线程的锁: 探针会改全局计数, 两个并发探针会互相污染判据
         self._kbd_verify_lock = threading.Lock()
-        # 边界现场取证的已输出行数(见 _diag_edge_event)
+        # 边界现场取证的已输出行数与节流时刻(见 _diag_edge_event)
         self._diag_lines = 0
+        self._diag_mono = 0.0
         # 键盘钩子自愈(见 _kbd_heal_loop): 同一时刻只允许一轮在跑
         self._kbd_healing = False
         self._kbd_heal_lock = threading.Lock()
@@ -1465,8 +1466,27 @@ class Server:
         就得看**主机这一侧**每个事件的原始位移与当时的真实光标位置。
         这里只在光标距跨越边 60px 内记录, 并限制总行数, 平时零开销。
         """
-        if not self.DIAG_EDGE or self._diag_lines >= self.DIAG_MAX_LINES:
+        # 诊断绝不能抛异常打断输入热路径: 有些测试/嵌入式调用不经过 __init__
+        # (见 tests 里的 _bare_server, 它的 _edge 是假的), 所以整段兜住。
+        if not self.DIAG_EDGE:
             return
+        try:
+            self._diag_edge_event_now(ev)
+        except Exception:  # noqa: BLE001
+            return
+
+    def _diag_edge_event_now(self, ev: InputEvent) -> None:
+        if getattr(self, "_diag_lines", 0) >= self.DIAG_MAX_LINES:
+            return
+        # ★ 只在**非穿越态**记录: 穿越期间主机光标被钩子冻住不动, 记它毫无
+        #   意义而且 1000 事件/秒会瞬间把行数配额烧光(实测: 6000 行只够 6 秒,
+        #   恰好把真正要看的"交回控制权之后"那一段全挤掉了)。
+        if self._edge is not None and self._edge.is_outside:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_diag_mono", 0.0) < 0.002:   # 最多 500 行/秒
+            return
+        self._diag_mono = now
         x, y = get_cursor_pos()
         r = self._edge.self_rect if self._edge is not None else None
         if r is None:
@@ -1482,7 +1502,7 @@ class Server:
             near = (r.bottom - 1 - y) <= 60
         if not near:
             return
-        self._diag_lines += 1
+        self._diag_lines = getattr(self, "_diag_lines", 0) + 1
         print(f"[server][edge] dx={ev.a} dy={ev.b} 光标=({x},{y}) "
               f"穿越={self._edge.is_outside}", flush=True)
 

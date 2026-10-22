@@ -291,3 +291,51 @@ class TestInputThreadNeverBlocks:
         gate.set()
         assert srv._kbd_verify_thread is not None
         srv._kbd_verify_thread.join(timeout=2.0)
+
+# ===========================================================================
+# 4. 控制权在主电脑时, 本机指针不得驱动主机光标(2026-10-22 边缘"慢移不动")
+# ===========================================================================
+
+class TestLocalPointerDoesNotDriveHost:
+    """交回控制权后, 副机本机指针的任何移动都必须被丢弃。
+
+    真机现场(2026-10-22 17:39): 主机光标复位到 (1907,518) 之后, 用户
+    慢推了 **56 秒**才越过 12px 的边界; 用力拉一次(+96px)就过去了。
+    根因是交回控制权后 `_return_edge.is_outside` 一直是 True(要等下一次
+    EV_MOUSE_PLACE), 而本机光标就停在回传边上 —— 于是本机指针的任何
+    零点漂移(触摸板/无线接收器)都被当成"拖回主机"转发出去, 主机收到后
+    注入到**它自己的光标**上, 与用户手上的物理鼠标正面对抗。
+    """
+
+    def _agent(self):
+        a = Agent(server_host="127.0.0.1", enable_return=False)
+        a._return_edge = EdgeDetector(
+            self_rect=ScreenRect(0, 0, 4480, 1600),
+            peer_rect=ScreenRect(0, 0, 0, 0),
+            side="left", confirm_frames=1,
+        )
+        a._input_tx = _FakeTx()
+        return a
+
+    def test_local_moves_dropped_after_return(self):
+        a = self._agent()
+        a._host_has_control = True
+        a._return_edge._outside = True          # 交回后残留的边缘态
+        for _ in range(20):
+            a._on_return_event(_move(-1))       # 本机漂移
+        assert a._input_tx.sent == [], "控制权在主电脑时不得转发本机位移"
+        assert a._local_drift_dropped == 20
+        assert a.stats.get("events_returned", 0) == 0
+
+    def test_place_rearms_local_channel(self):
+        a = self._agent()
+        a._host_has_control = True
+        a._on_input_event(InputEvent(EV_MOUSE_PLACE, 0, 0, 30000, 0, 0))
+        assert a._host_has_control is False, "主机再次进入时必须解除抑制"
+
+    def test_return_sets_host_has_control(self, agent_at_edge):
+        a = agent_at_edge
+        a._on_input_event(_move(-5))
+        assert a.stats["events_returned"] == 1
+        assert a._host_has_control is True
+

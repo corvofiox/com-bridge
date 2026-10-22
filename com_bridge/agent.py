@@ -218,6 +218,12 @@ class Agent:
         self._returned = False
         # 交回那一刻的单调时间(RETURN_STALE_DRAIN_S 的起点)
         self._returned_mono = 0.0
+        # ★ 控制权是否已在主电脑手上(交回后置 True, 下一次 EV_MOUSE_PLACE 清 False)。
+        #   为 True 时本机指针的移动**不得**转发给主机(否则会与用户的物理鼠标
+        #   对抗, 见 _on_return_event 的长注释)。
+        self._host_has_control = False
+        self._local_drift_dropped = 0
+        self._local_drift_log = 0.0
         # 诊断日志计数与节流(COM_BRIDGE_DIAG_EDGE / 标记文件开启时用)
         self._diag_lines = 0
         self._diag_edge_last = 0.0
@@ -953,6 +959,8 @@ class Agent:
                 self._return_place_sent = False
                 # 新一轮穿越: 解除"已交回控制权"的去抖锁(同上)
                 self._returned = False
+                # 控制权回到本机(副机): 本机指针重新可以参与(手势通道)
+                self._host_has_control = False
                 d = virtual_desktop()
                 # ★ 主机光标进入: 恢复本机光标可见(它就是当前活动光标)。
                 #   若之前回传时隐藏了, 这里必须恢复 —— 否则用户在副机上
@@ -1058,6 +1066,7 @@ class Agent:
                             # 日志与 hide() 每轮穿越只会发生**一次**。
                             self._returned = True
                             self._returned_mono = time.monotonic()
+                            self._host_has_control = True
                             print("[agent] 光标离开回传边 -> 交回主电脑控制权",
                                   flush=True)
                             # ★ 控制权回到主机: 隐藏本机光标
@@ -1427,6 +1436,33 @@ class Agent:
         # ★ 只处理鼠标事件。这条路径是"副机自己接了物理键鼠、把光标拖到
         #   回传边"的手势通道; 键盘不经它转发(理由见下方 send 处的注释)。
         if not ev.is_mouse:
+            return
+        # ★★★ 控制权已经在主电脑手上时, **本机指针的任何移动都不许往主机送**
+        #   (2026-10-22 真机实测的根因, 用户原话: "慢移真的不动, 拉一下才动"):
+        #
+        #   交回控制权之后, 本机光标就停在回传边上(它本来就是顶到墙才回传的),
+        #   而 `_return_edge.is_outside` 也一直保持 True(要等下一次 EV_MOUSE_PLACE
+        #   才复位)。于是**本机指针在自己的桌面上一动** —— 哪怕只是触摸板/无线
+        #   接收器的零点漂移 —— 只要方向朝主机, 就会被当成"用户要把光标拖回主机"
+        #   而转发出去。主电脑收到后做 `move_relative`, 也就是**注入到它自己的
+        #   光标上**, 与用户手上的物理鼠标正面对抗:
+        #
+        #     用户慢慢往副机里推(+1px/事件) ←→ 本机漂移持续把主机光标往左拽
+        #
+        #   净效果是主机光标几乎不动 —— 实测 2026-10-22 17:39, 主机光标复位到
+        #   (1907,518) 之后, 用户慢推了 **56 秒**才越过 12px 的边界; 而"用力拉"
+        #   一次给出 +96px, 漂移拽不过它, 于是"拉一下才动"。
+        #
+        #   本机指针该管的是它自己(移动本机光标, 由 hide_on_motion 恢复可见),
+        #   不该去驱动主电脑的光标 —— 控制权在谁手里, 输入就归谁。
+        if self._host_has_control:
+            self._local_drift_dropped += 1
+            now = time.monotonic()
+            if now - self._local_drift_log >= 1.0:
+                self._local_drift_log = now
+                print(f"[agent] 忽略本机指针移动 {self._local_drift_dropped} 次"
+                      f"(控制权在主电脑, 不能让本机漂移驱动主机光标)"
+                      f" 最近 dx={ev.a} dy={ev.b}", flush=True)
             return
         side = self._return_edge.side
         if ev.type == EV_MOUSE_MOVE_REL:
