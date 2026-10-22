@@ -257,3 +257,55 @@ def test_text_roundtrip_real_clipboard():
     got = cb.sample()
     assert got and got.get(cb.FMT_TEXT) == "跨机剪贴板 test".encode("utf-8")
     assert cb.is_owned_by_us(), "写进去的内容必须带所有权标记"
+
+
+# --- DIB 规范化(2026-10-23 图片传不过去的根因) -------------------------
+
+def _mk_dib(w: int, h: int, bits: int = 32, compression: int = 0,
+            masks: bytes = b"") -> bytes:
+    pixels = b"\x40\x30\x20\xff" * (w * h)
+    head = struct.pack("<IiiHHIIiiII", 40, w, -h, 1, bits, compression,
+                       len(pixels), 0, 0, 0, 0)
+    return head + masks + pixels
+
+
+def test_dib_bit_rgb_passes_through():
+    dib = _mk_dib(8, 4)
+    assert cb.normalise_dib(dib) == dib
+
+
+def test_dib_bitfields_is_normalised_not_dropped():
+    """★ 真机的截图就是 BI_BITFIELDS(40 字节头 + 12 字节掩码 + BGRA 像素)。
+
+    旧实现只接受 BI_RGB, 于是这种图被整份丢掉 —— 用户看到的就是
+    "图片不能跨机粘贴"。Deskflow 的 normaliseMalformedMacDib 是**转换**: 
+    把 biCompression 改回 BI_RGB 并丢掉掩码块。
+    """
+    masks = struct.pack("<III", 0x00FF0000, 0x0000FF00, 0x000000FF)
+    src = _mk_dib(8, 4, compression=3, masks=masks)
+    out = cb.normalise_dib(src)
+    assert out, "BI_BITFIELDS 必须能被接受"
+    assert len(out) == 40 + 8 * 4 * 4, "掩码块必须被丢掉"
+    assert struct.unpack_from("<I", out, 16)[0] == 0, "必须改写为 BI_RGB"
+    assert cb.image_size(out) == (8, 4, 32)
+    # 像素原样保留
+    assert out[40:] == src[52:]
+
+
+def test_dib_jpeg_or_png_compression_rejected():
+    """BI_JPEG(=4)/BI_PNG(=5) 的内容不是像素, 不能当位图发。"""
+    for comp in (4, 5):
+        assert cb.normalise_dib(_mk_dib(4, 4, compression=comp)) == b""
+
+
+def test_dib_garbage_rejected():
+    assert cb.normalise_dib(b"") == b""
+    assert cb.normalise_dib(b"1234") == b""
+    assert cb.normalise_dib(b"\x00" * 40) == b""
+
+
+def test_describe_mentions_image_size():
+    dib = _mk_dib(16, 8)
+    text = cb.describe({cb.FMT_BITMAP: dib})
+    assert "图片" in text and "16x8" in text
+    assert "文字" in cb.describe({cb.FMT_TEXT: b"hi"})

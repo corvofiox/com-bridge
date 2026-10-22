@@ -248,25 +248,61 @@ def sample() -> dict | None:
         _close_clipboard()
 
 
-def _read_dib_locked() -> bytes:
-    """读 CF_DIB(调用方已持有剪贴板锁)。只接受 BI_RGB, 否则返回空。
+BI_RGB = 0
+BI_BITFIELDS = 3
 
-    Deskflow 的 Bitmap 规范就是 CF_DIB 的原始字节: BITMAPINFOHEADER + 像素,
-    没有 BMP 文件头; 且要求 BI_RGB(未压缩)。
+
+def normalise_dib(raw: bytes) -> bytes:
+    """把剪贴板里的 DIB **规范化成 BI_RGB**(纯函数, 可单测)。
+
+    ★★★ 这一步是照搬 Deskflow 的 `normaliseMalformedMacDib()`, 而不是我原先
+      以为的"只接受 BI_RGB"。真发现(2026-10-23): 用户复制的截图在剪贴板里是
+
+          biSize=40 biBitCount=32 biCompression=3(BI_BITFIELDS)  长度 = 40+12+像素
+
+      也就是头部后面**多了 12 字节的三个颜色掩码**。当时的实现直接把它当
+      "不支持的格式"丢掉了 —— 于是"图片不能跨机粘贴", 而其它格式(文字/文件)
+      都正常。
+
+      Deskflow 的做法是转换而不是丢弃:
+        * 只针对 `biSize == 40 && biPlanes == 1 && biBitCount == 32 &&
+          biCompression == BI_BITFIELDS && 长度恰好是 40 + w*h*4`(即
+          INFOHEADER + 掩码 + BGRA 像素) 这一种"macOS 风格"的情况;
+        * 做法: 把头部里的 biCompression 改回 BI_RGB, 并**丢掉那 12 字节掩码**
+          (因为 header 只有 40 字节、没有掩码字段, 掩码只能跟在后面; 若保留,
+          Windows 会把前 12 字节像素当成掩码读)。
+
+    BI_RGB 的 DIB 原样返回; 其它压缩方式(BI_JPEG/BI_PNG 之类, 内容不是像素)
+    仍然返回空 —— 那些没法直接当位图用。
     """
+    if not raw or len(raw) < 40:
+        return b""
+    bi_size = struct.unpack_from("<I", raw, 0)[0]
+    if bi_size < 40 or len(raw) < bi_size or len(raw) > MAX_PAYLOAD:
+        return b""
+    bi_width = struct.unpack_from("<i", raw, 4)[0]
+    bi_height = struct.unpack_from("<i", raw, 8)[0]
+    bi_planes = struct.unpack_from("<H", raw, 12)[0]
+    bi_bits = struct.unpack_from("<H", raw, 14)[0]
+    bi_compression = struct.unpack_from("<I", raw, 16)[0]
+    if bi_compression == BI_RGB:
+        return raw
+    pixels = abs(int(bi_width)) * abs(int(bi_height)) * 4
+    if (bi_size == 40 and bi_planes == 1 and bi_bits == 32
+            and bi_compression == BI_BITFIELDS
+            and len(raw) >= bi_size + 12 + pixels):
+        head = bytearray(raw[:bi_size])
+        struct.pack_into("<I", head, 16, BI_RGB)
+        return bytes(head) + raw[bi_size + 12:bi_size + 12 + pixels]
+    return b""
+
+
+def _read_dib_locked() -> bytes:
+    """读 CF_DIB(调用方已持有剪贴板锁)并规范化成 BI_RGB。"""
     try:
         if not user32.IsClipboardFormatAvailable(CF_DIB):
             return b""
-        raw = _read_global(user32.GetClipboardData(CF_DIB))
-        if not raw or len(raw) < 40:
-            return b""
-        bi_size = struct.unpack_from("<I", raw, 0)[0]
-        if bi_size < 40 or len(raw) < bi_size or len(raw) > MAX_PAYLOAD:
-            return b""
-        bi_compression = struct.unpack_from("<I", raw, 16)[0]
-        if bi_compression != 0:          # 只要 BI_RGB
-            return b""
-        return raw
+        return normalise_dib(_read_global(user32.GetClipboardData(CF_DIB)))
     except Exception:  # noqa: BLE001
         return b""
 
@@ -532,6 +568,30 @@ def unpack_paths(raw: bytes) -> list[str]:
         return out
     except Exception:  # noqa: BLE001
         return []
+
+
+def describe(payload: dict[str, bytes]) -> str:
+    """把 {格式: 字节} 说成一句人话, 便于日志里确认"到底传了什么"。
+
+    现场排障时这行很关键: 用户报"图片传不过去"时, 一眼就能看出是
+    **没采到图**(只有 text), 还是采到了但体积异常。
+    """
+    parts = []
+    for fmt in (FMT_TEXT, FMT_HTML, FMT_BITMAP, FMT_FILES):
+        data = payload.get(fmt)
+        if not data:
+            continue
+        if fmt == FMT_BITMAP:
+            w, h, bits = image_size(data)
+            parts.append(f"图片 {w}x{h}x{bits} ({len(data)} 字节)")
+        elif fmt == FMT_FILES:
+            doc = unpack_file_manifest(data)
+            parts.append(f"文件 {len(doc['files'])} 个 ({doc['total']} 字节)")
+        elif fmt == FMT_TEXT:
+            parts.append(f"文字 {len(data)} 字节")
+        else:
+            parts.append(f"HTML {len(data)} 字节")
+    return ", ".join(parts) or "(空)"
 
 
 def image_size(dib: bytes) -> tuple[int, int, int]:

@@ -815,9 +815,16 @@ class Server:
                 pass
         ok = cb.apply(payload)
         self.stats["clip_received"] = self.stats.get("clip_received", 0) + 1
-        if not ok:
+        if ok:
+            # 这一行是"本机剪贴板真的写进去了"的唯一凭证 —— 用户报
+            # "图片不能粘贴"时, 先看有没有它: 没有 = 没写进本机剪贴板;
+            # 有 = 写进去了, 问题在目标程序支不支持 CF_DIB。
+            print(f"[server] 剪贴板已写入本机: {cb.describe(payload)}", flush=True)
+        else:
             self.stats["clip_apply_failed"] = \
                 self.stats.get("clip_apply_failed", 0) + 1
+            print(f"[server] !! 写剪贴板失败(被别的程序占用?): "
+                  f"{cb.describe(payload)}", flush=True)
 
     def _start_peer_watchdog(self) -> None:
         """★ 心跳丢失看门狗 —— 穿越态唯一的**自动**退出路径。

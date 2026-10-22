@@ -341,6 +341,8 @@ class ClipInbox(_BoundThread):
                         doc = cb.unpack_file_manifest(files_raw)
                         manifest = doc["files"]
                     if items:
+                        print(f"[clip] 收到 {cb.describe(items)} / "
+                              f"{len(clip)} 字节", flush=True)
                         self._emit(items)
                         self.stats["payloads"] += 1
                 elif kind == K_FILE_START:

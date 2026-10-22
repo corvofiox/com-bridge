@@ -122,6 +122,8 @@ class ClipboardSync:
             return
         self._last_hash = h
         try:
+            print(f"[clip] 发送 {cb.describe(payload)} / "
+                  f"{len(blob)} 字节", flush=True)
             self._on_copy(blob)
             self.stats["sent"] = self.stats.get("sent", 0) + 1
         except Exception:  # noqa: BLE001
