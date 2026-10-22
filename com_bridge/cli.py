@@ -345,6 +345,11 @@ def _cmd_gui(_args) -> int:
         path = gui_log.install()
         if path:
             print(f"[gui] 诊断日志 -> {path}", flush=True)
+        try:
+            from . import uidpi
+            print(f"[gui] {uidpi.desc()}", flush=True)
+        except Exception:  # noqa: BLE001
+            pass
     except Exception as exc:  # noqa: BLE001
         # 日志失败绝不能阻止 GUI 启动
         try:

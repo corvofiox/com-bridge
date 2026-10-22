@@ -285,16 +285,26 @@ FONT_MONO_SMALL = ("Consolas", 8)
 FONT_KEYCAP = ("Microsoft YaHei UI", 8)
 
 # --- 间距 / 圆角 --------------------------------------------------------
-PAD_XS, PAD_S, PAD_M, PAD_L, PAD_XL = 4, 8, 12, 16, 24
-WINDOW_W = 620
-WINDOW_H = 660
-PAGE_PAD = 20          # 页面左右留白(卡片可见边缘)
-CARD_M = R.CARD_M      # 卡片阴影预留边(与 R.card 一致)
-CARD_PAD_X = 18        # 卡片内每行左右留白
-RADIUS_CARD = 16
-RADIUS_BTN = 14
-RADIUS_SEG = 10
-RADIUS_FIELD = 9
+#
+# ★ 全部是"设计稿像素"(96 DPI 下的值), 导入期乘上界面缩放系数(uidpi.SCALE)。
+#   本进程是 per-monitor DPI 感知的, tkinter 不会自动放大 —— 100% 缩放下设计
+#   好的 620×660 窗口在 200% 的笔记本屏上只有原来四分之一面积, 字小得看不清
+#   (用户实测: "副机 2560x1600, GUI 看起来很小")。所以这里统一过 sp()。
+def sp(px: float) -> int:
+    """设计稿像素 -> 实际像素。"""
+    return int(round(float(px) * R.SCALE))
+
+
+PAD_XS, PAD_S, PAD_M, PAD_L, PAD_XL = (sp(4), sp(8), sp(12), sp(16), sp(24))
+WINDOW_W = sp(620)
+WINDOW_H = sp(660)
+PAGE_PAD = sp(20)          # 页面左右留白(卡片可见边缘)
+CARD_M = sp(R.CARD_M)      # 卡片阴影预留边(与 R.card 一致)
+CARD_PAD_X = sp(18)        # 卡片内每行左右留白
+RADIUS_CARD = sp(16)
+RADIUS_BTN = sp(14)
+RADIUS_SEG = sp(10)
+RADIUS_FIELD = sp(9)
 
 
 def BACKGROUND_OF(widget: tk.Misc) -> str:

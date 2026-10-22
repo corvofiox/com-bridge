@@ -28,7 +28,17 @@ class _BaseWindow:
     """次级窗口基类: 单例 + 关闭只隐藏。"""
 
     title = "Com Bridge"
-    geometry = "640x420"
+    geometry = "640x420"      # 设计稿尺寸, 实例化时按界面缩放换算
+
+    @staticmethod
+    def _scale_geometry(spec: str) -> str:
+        """把 "640x420" 按界面缩放换算成实际像素。"""
+        try:
+            from . import ui_theme as T
+            w, h = spec.lower().split("x")
+            return f"{T.sp(int(w))}x{T.sp(int(h))}"
+        except Exception:  # noqa: BLE001
+            return spec
 
     def __init__(self, master: tk.Misc, app) -> None:
         self.app = app
@@ -64,7 +74,7 @@ class _BaseWindow:
     def _create(self) -> None:
         w = tk.Toplevel(self.master)
         w.title(self.title)
-        w.geometry(self._pos or self.geometry)
+        w.geometry(self._pos or self._scale_geometry(self.geometry))
         w.minsize(480, 320)
         w.configure(background=T.BG)
         w.protocol("WM_DELETE_WINDOW", self.hide)
@@ -133,12 +143,12 @@ class StatusWindow(_BaseWindow):
         self._timer: str | None = None
 
     def build(self, w: tk.Toplevel) -> None:
-        page = tk.Frame(w, background=T.BG, padx=T.PAGE_PAD, pady=16)
+        page = tk.Frame(w, background=T.BG, padx=T.PAGE_PAD, pady=T.sp(16))
         page.pack(fill="both", expand=True)
 
         # ── 标题栏 ─────────────────────────────────────────────────
         top = tk.Frame(page, background=T.BG)
-        top.pack(fill="x", pady=(0, 14))
+        top.pack(fill="x", pady=(0, T.sp(14)))
         title_box = tk.Frame(top, background=T.BG)
         title_box.pack(side="left")
         tk.Label(title_box, text="实时状态", background=T.BG,
@@ -159,16 +169,16 @@ class StatusWindow(_BaseWindow):
                 current_group = group
                 first_in_group = True
                 wrap = tk.Frame(page, background=T.BG)
-                wrap.pack(fill="x", pady=(0, 6))
+                wrap.pack(fill="x", pady=(0, T.sp(6)))
                 card = T.Card(wrap, bg=T.BG)
                 card.pack(fill="x")
                 group_body = card.body
                 head = tk.Frame(group_body, background=T.CARD)
-                head.pack(fill="x", padx=T.CARD_PAD_X, pady=(12, 6))
+                head.pack(fill="x", padx=T.CARD_PAD_X, pady=(T.sp(12), T.sp(6)))
                 tk.Label(head, text=group, background=T.CARD,
                          foreground=T.TEXT_FAINT, font=T.FONT_UI_SMALL,
                          padx=0).pack(side="left")
-            row = tk.Frame(group_body, background=T.CARD, height=38)
+            row = tk.Frame(group_body, background=T.CARD, height=T.sp(38))
             row.pack(fill="x")
             row.pack_propagate(False)
             if not first_in_group:
@@ -180,11 +190,11 @@ class StatusWindow(_BaseWindow):
 
             dot = T.status_dot(holder, color=T.TEXT_FAINT, size=7,
                                glow=False)
-            dot.pack(side="left", padx=(0, 10))
+            dot.pack(side="left", padx=(0, T.sp(10)))
             # ★ 固定宽度的名称列: 用 Frame + pack_propagate(False) 撑出
             #   像素级宽度, 中文用 Label 的 width(字符数) 不可靠。
-            name_box = tk.Frame(holder, background=T.CARD, width=96,
-                                height=18)
+            name_box = tk.Frame(holder, background=T.CARD, width=T.sp(96),
+                                height=T.sp(18))
             name_box.pack(side="left")
             name_box.pack_propagate(False)
             tk.Label(name_box, text=label, background=T.CARD,

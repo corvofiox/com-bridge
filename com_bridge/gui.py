@@ -303,6 +303,12 @@ class ComBridgeGui:
 
         root = self.root
         root.title("Com Bridge")
+        # ★ 让 Tk 的**磅值**字体跟随界面缩放(1pt = scaling/72 像素)。
+        #   我们自己的 PIL 位图字体走 ui_render.font 的 SCALE, 两条路各管一半。
+        try:
+            root.tk.call("tk", "scaling", 96.0 * R.SCALE / 72.0)
+        except tk.TclError:
+            pass
         T.apply_theme(root)
         root.configure(background=T.BG)
 
@@ -337,7 +343,7 @@ class ComBridgeGui:
 
         # 卡片容器左右留 CARD_M, 使**可见卡边**正好落在 PAGE_PAD
         wrap_pad = T.PAGE_PAD - T.CARD_M
-        gap_between = 14 - T.CARD_M * 2        # pack 间距(可见卡间距 14)
+        gap_between = T.sp(14) - T.CARD_M * 2        # pack 间距(可见卡间距 14)
 
         # ── 顶栏: 已合并进状态卡, 这里不再单独占一行 ────────────────
 
@@ -351,11 +357,11 @@ class ComBridgeGui:
         # ── 状态卡 ─────────────────────────────────────────────────
         hero_wrap = tk.Frame(root, background=T.BG)
         hero_wrap.grid(row=0, column=0, sticky="ew", padx=wrap_pad,
-                       pady=(16 - T.CARD_M, 0))
+                       pady=(T.sp(16) - T.CARD_M, 0))
         hero = T.Card(hero_wrap, bg=T.BG)
         hero.pack(fill="x")
         hin = tk.Frame(hero.body, background=T.CARD)
-        hin.pack(fill="x", padx=T.CARD_PAD_X, pady=16)
+        hin.pack(fill="x", padx=T.CARD_PAD_X, pady=T.sp(16))
 
         # ★★★ 2026-10-21 用户反馈: "左上角, 右下角全是大片空白, 运行中的
         #   标识完全悬空, 不能更紧凑一点么"。
@@ -381,11 +387,11 @@ class ComBridgeGui:
         nav.pack(side="right")
         theme_label = "浅色" if T.is_dark() else "深色"
         T.PillButton(nav, "日志", self._open_log_window,
-                     bg=T.CARD).pack(side="right", padx=(6, 0))
+                     bg=T.CARD).pack(side="right", padx=(T.sp(6), 0))
         T.PillButton(nav, "状态", self._open_status_window,
                      bg=T.CARD).pack(side="right")
         T.PillButton(nav, theme_label, self._on_toggle_theme,
-                     bg=T.CARD).pack(side="right", padx=(0, 6))
+                     bg=T.CARD).pack(side="right", padx=(0, T.sp(6)))
 
         # ---- row1: 摘要(含音频缓冲) ----
         # ★★★ 2026-10-21 用户决定: "保留左边的缓冲, 把缓冲的文本改为
@@ -395,7 +401,7 @@ class ComBridgeGui:
         #   单独放大放在最显眼的位置, 会让人误以为是"整条链路的延迟"。
         #   现在它作为摘要的一部分, 明确标成"音频缓冲"。
         r1 = tk.Frame(grid, background=T.CARD)
-        r1.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        r1.grid(row=1, column=0, sticky="ew", pady=(T.sp(10), 0))
         self._hero_meta = tk.StringVar(value="选择角色后点 ▶")
         self._hero_meta_lbl = tk.Label(
             r1, textvariable=self._hero_meta, background=T.CARD,
@@ -405,21 +411,24 @@ class ComBridgeGui:
 
         # ---- row2: 标签 | 播放/停止 ----
         r2 = tk.Frame(grid, background=T.CARD)
-        r2.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        r2.grid(row=2, column=0, sticky="ew", pady=(T.sp(10), 0))
         tags = tk.Frame(r2, background=T.CARD)
-        tags.pack(side="left", pady=(6, 0))
+        tags.pack(side="left", pady=(T.sp(6), 0))
         for name in ("键盘鼠标", "音频同步"):
-            T.Tag(tags, name, bg=T.CARD).pack(side="left", padx=(0, 6))
+            T.Tag(tags, name, bg=T.CARD).pack(
+                side="left", padx=(0, T.sp(6)))
 
         ctl = tk.Frame(r2, background=T.CARD)
         ctl.pack(side="right")
         # ★ 用户指定顺序: "播放在左, 停止在右"。
-        self._start_btn = T.MediaButton(ctl, "play", self._on_start, size=28,
+        self._start_btn = T.MediaButton(ctl, "play", self._on_start,
+                                        size=T.sp(28),
                                         bg=T.CARD)
         self._start_btn.pack(side="left")
-        self._stop_btn = T.MediaButton(ctl, "stop", self._on_stop, size=28,
+        self._stop_btn = T.MediaButton(ctl, "stop", self._on_stop,
+                                       size=T.sp(28),
                                        bg=T.CARD)
-        self._stop_btn.pack(side="left", padx=(10, 0))
+        self._stop_btn.pack(side="left", padx=(T.sp(10), 0))
 
         # ── 设置卡 ─────────────────────────────────────────────────
         set_wrap = tk.Frame(root, background=T.BG)
@@ -458,7 +467,7 @@ class ComBridgeGui:
         #   窗口撑到固定高度。窗口高度由内容决定(见下方 geometry)。
         foot = tk.Frame(root, background=T.BG)
         foot.grid(row=3, column=0, sticky="ew", padx=T.PAGE_PAD,
-                  pady=(10, 12))
+                  pady=(T.sp(10), T.sp(12)))
         tk.Label(foot, text="运行时最小化到托盘，关闭窗口不停止服务",
                  background=T.BG, foreground=T.TEXT_FAINT,
                  font=T.FONT_UI_TINY, padx=0).pack(side="left")
@@ -495,7 +504,7 @@ class ComBridgeGui:
           "说明有没有换行"带歪。
         """
         from . import ui_theme as T
-        row = tk.Frame(parent, background=T.CARD, height=72)
+        row = tk.Frame(parent, background=T.CARD, height=T.sp(72))
         row.pack(fill="x")
         row.pack_propagate(False)
         if top_border:
@@ -503,8 +512,8 @@ class ComBridgeGui:
         holder = tk.Frame(row, background=T.CARD)
         holder.pack(fill="both", expand=True, padx=T.CARD_PAD_X)
 
-        T.Badge(holder, icon, size=30, index=index,
-                bg=T.CARD).pack(side="left", padx=(0, 12))
+        T.Badge(holder, icon, size=T.sp(30), index=index,
+                bg=T.CARD).pack(side="left", padx=(0, T.sp(12)))
         tf = tk.Frame(holder, background=T.CARD)
         tf.pack(side="left")
         tk.Label(tf, text=title, background=T.CARD, foreground=T.TEXT,
@@ -513,7 +522,7 @@ class ComBridgeGui:
               else {"text": sub})
         tk.Label(tf, **kw, background=T.CARD, foreground=T.TEXT_FAINT,
                  font=T.FONT_UI_SMALL, anchor="w", justify="left",
-                 padx=0).pack(anchor="w", pady=(2, 0))
+                 padx=0).pack(anchor="w", pady=(T.sp(2), 0))
         return holder
 
     # -- 主题切换 ------------------------------------------------------
@@ -1481,9 +1490,14 @@ class ComBridgeGui:
                     + (f", 心跳 {d['heartbeats']}" if d["heartbeats"] else ""),
                     1 if d["packets"] else 2)
             if clock:
+                jumps = int(getattr(clock, "offset_jumps", 0))
+                maxjump = float(
+                    getattr(clock, "max_offset_jump_us", 0.0)) / 1000.0
                 out["clock"] = (
-                    f"offset {clock.offset_us / 1000:+.2f}ms / "
-                    f"rtt {clock.rtt_us / 1000:.2f}ms / 样本 {clock.samples}",
+                    f"rtt {clock.rtt_us / 1000:.2f}ms / 样本 {clock.samples}"
+                    f" / 偏移跳变 {jumps} 次(最大 {maxjump:.2f}ms)"
+                    f" ｜ 单调钟偏移 {clock.offset_us / 1000:+.0f}ms"
+                    f"（两机开机时刻之差，换算用，不是时钟误差）",
                     1 if synced else 2)
         return out
 
@@ -1580,8 +1594,18 @@ class ComBridgeGui:
                     extra = ""
                     if clock is not None and getattr(clock, "clock", None):
                         try:
-                            off = clock.clock.offset_us / 1000.0
-                            extra = f"（对时偏差 {off:+.1f} ms）"
+                            # ★ 以前这里显示 offset_us —— 那是两机**单调钟
+                            #   (perf_counter)纪元**之差, 等于"开机时刻相差
+                            #   多少"(实测 +47568320ms ≈ 13.2 小时), 它是换算
+                            #   基准而不是时钟误差。摆在界面上只会让人以为
+                            #   时钟差了 13 小时。用户真正关心的"对时好不好"
+                            #   = 往返 rtt 与偏移跳变次数。
+                            cl = clock.clock
+                            extra = f"（对时往返 {cl.rtt_us / 1000.0:.1f} ms"
+                            jumps = int(getattr(cl, "offset_jumps", 0))
+                            if jumps:
+                                extra += f" · 偏移跳变 {jumps} 次"
+                            extra += "）"
                         except Exception:  # noqa: BLE001
                             pass
                     parts.append(head + extra)

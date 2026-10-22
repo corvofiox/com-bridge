@@ -26,8 +26,13 @@ import tkinter as tk
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
 
+from . import uidpi
+
 # 超采样倍数
 SS = 4
+
+# 界面缩放系数(高 DPI 屏上让位图与文字一起放大; 见 uidpi.py)
+SCALE = uidpi.SCALE
 
 # 卡片阴影预留边: 与 gui 的布局间距配套(见 gui._build 的 CARD_PAD)
 CARD_M = 6
@@ -82,7 +87,8 @@ _FONT_CACHE: dict[tuple[int, bool], ImageFont.FreeTypeFont] = {}
 
 
 def font(px: int, bold: bool = False):
-    """取中文字体(PIL 用)。px 是像素高度, 不是磅值。"""
+    """取中文字体(PIL 用)。px 是**设计稿**像素高度(会自动乘界面缩放)。"""
+    px = max(6, int(round(float(px) * SCALE)))
     key = (int(px), bool(bold))
     hit = _FONT_CACHE.get(key)
     if hit is not None:
