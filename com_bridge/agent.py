@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 import socket
 import sys
 import threading
@@ -146,6 +147,27 @@ class Agent:
     # (用户故意甩回去)"不会误丢。
     RETURN_STALE_DRAIN_S = 0.35
 
+    # ★★★ "推过边界"多少像素才真的回传(2026-10-22 第二次修, 见 _on_input_event)。
+    #   背景: 用户反复报"光标在副机靠主机那一侧的边缘会被吸住/粘滞"。
+    #   旧规则是"抵边(距边 ≤2px) + 朝主机方向"就立刻交回控制权 ——
+    #   而进入副机时光标本来就落在离边 ENTRY_JUMP_ZONE_PX 处, 于是**手一点点
+    #   向左的漂移**(斜着推、或者管道滞后导致手已回拉而指针还在往左走)
+    #   就足以把控制权甩回主机; 回到主机又同样落在离边 12px 处, 一个向右的
+    #   抖动又跳回去 —— 手上感觉就是"被吸在边上"。
+    #   新规则照搬"推过边界"的直觉: 光标顶到墙上之后, **继续朝主机方向多推
+    #   这么多像素**才交回。所以边缘的手感是"硬墙"(指针停在边上), 只有真的
+    #   往外顶才穿过去。24px 是"抖动不误触 / 一甩就过"的折中(1000Hz 鼠标下
+    #   一次快速甩动远超这个数, 慢推约 0.1~0.2s)。
+    RETURN_PUSH_OUT_PX = 24
+
+    # 上面那个累计值的记忆窗口(秒): 停手超过它就从零重新计。
+    # 否则"贴边停一会儿再轻轻一推"会沿用之前的累计, 变成意外的回传。
+    RETURN_PUSH_MEMORY_S = 0.5
+
+    # 环境变量 COM_BRIDGE_DIAG_EDGE=1 时, 逐事件打印回传边附近的细节
+    # (dx/x/累计/判定)。用于现场取证 —— 只在排障时开, 平时零开销。
+    DIAG_EDGE = bool(os.environ.get("COM_BRIDGE_DIAG_EDGE"))
+
     def __init__(self, server_host: str | None = None, name: str = "agent",
                  mute_local: bool = True, discover_timeout_s: float = 3.0,
                  prefer_rate: int = 48000, control_port: int | None = None,
@@ -198,6 +220,13 @@ class Agent:
         self._returned = False
         # 交回那一刻的单调时间(RETURN_STALE_DRAIN_S 的起点)
         self._returned_mono = 0.0
+        # "推过边界"的累计像素与最近一次推的时刻(见 RETURN_PUSH_OUT_PX)
+        self._push_acc = 0
+        self._push_mono = 0.0
+        # 这一轮推送的起始时刻(只用于日志里的耗时)
+        self._push_t0 = 0.0
+        # 诊断日志节流(COM_BRIDGE_DIAG_EDGE 时用)
+        self._diag_edge_last = 0.0
         # 已发出的打洞心跳数(GUI 用它确认打洞在持续进行)
         self._punch_heartbeats = 0
         self._adv_host: str | None = None
@@ -1009,39 +1038,66 @@ class Agent:
                     # 正常注入 —— 否则副机会**永久吞掉**输入, 用户彻底失控。
                     self._returned = False
                 toward_host = self._is_toward_host(ev.a, ev.b)
-                if toward_host:
+                if not toward_host:
+                    # 朝屏内/朝别的方向: 清空"推过边界"的累计(用户显然不想走)
+                    self._push_acc = 0
+                    self._push_t0 = 0.0
+                else:
                     x, y = get_cursor_pos()
                     if self._at_return_edge(x, y, ev.a, ev.b):
-                        if self._input_tx is not None:
-                            # ★★ BUG3② 修复: 先把**回程方位**发给主电脑,
-                            #   再发这条位移。主电脑的光标在整个穿越期间
-                            #   被钉在**进入时的位置**, 只靠相对位移累积
-                            #   的话落点永远是当初跳过来的那一点 —— 用户
-                            #   在副机上移动到哪个高度回来完全丢失。
-                            #   这里把光标沿回传边的切向比例报过去, 主机
-                            #   用它做绝对定位(与去程的 EV_MOUSE_PLACE 对称)。
-                            #
-                            #   ★ 只发**一次**: `_at_return_edge` 在越过之后
-                            #   会持续返回 True(边缘态一直成立), 若不设闸就
-                            #   会每个事件都发一条, 主机会被反复绝对定位,
-                            #   反而把光标钉死在同一个切向坐标上。
-                            if not self._return_place_sent:
-                                self._send_return_place(x, y)
-                                self._return_place_sent = True
-                            self._input_tx.send(ev)
-                            self.stats["events_returned"] = \
-                                self.stats.get("events_returned", 0) + 1
-                            # 去抖锁: 本条之后的积压位移一律丢弃, 因此下面
-                            # 的日志与 hide() 每轮穿越只会发生**一次**。
-                            self._returned = True
-                            self._returned_mono = time.monotonic()
-                            print("[agent] 光标离开回传边 -> 交回主电脑控制权",
-                                  flush=True)
-                            # ★ 控制权回到主机: 隐藏本机光标
-                            #   (主机光标恢复可见是主机侧 crossing 时做的)。
-                            if self._hider is not None:
-                                self._hider.hide()
-                        return
+                        overshoot = self._overshoot_px(x, y, ev.a, ev.b)
+                        now = time.monotonic()
+                        if (now - self._push_mono) > self.RETURN_PUSH_MEMORY_S:
+                            self._push_acc = 0        # 停手超过窗口: 从零重新计
+                        if self._push_acc == 0:
+                            self._push_t0 = now       # 这一轮推送的起点
+                        self._push_acc += overshoot
+                        self._push_mono = now
+                        if self._push_acc >= self.RETURN_PUSH_OUT_PX:
+                            pushed = self._push_acc
+                            spent_ms = (now - self._push_t0) * 1000.0 \
+                                if self._push_t0 else 0.0
+                            self._push_acc = 0
+                            self._push_t0 = 0.0
+                            if self._input_tx is not None:
+                                # ★★ BUG3② 修复: 先把**回程方位**发给主电脑,
+                                #   再发这条位移。主电脑的光标在整个穿越期间
+                                #   被钉在**进入时的位置**, 只靠相对位移累积
+                                #   的话落点永远是当初跳过来的那一点 —— 用户
+                                #   在副机上移动到哪个高度回来完全丢失。
+                                #   这里把光标沿回传边的切向比例报过去, 主机
+                                #   用它做绝对定位(与去程的 EV_MOUSE_PLACE 对称)。
+                                #
+                                #   ★ 只发**一次**: `_at_return_edge` 在越过之后
+                                #   会持续返回 True(边缘态一直成立), 若不设闸就
+                                #   会每个事件都发一条, 主机会被反复绝对定位,
+                                #   反而把光标钉死在同一个切向坐标上。
+                                if not self._return_place_sent:
+                                    self._send_return_place(x, y)
+                                    self._return_place_sent = True
+                                self._input_tx.send(ev)
+                                self.stats["events_returned"] = \
+                                    self.stats.get("events_returned", 0) + 1
+                                # 去抖锁: 本条之后的积压位移一律丢弃, 因此
+                                # 日志与 hide() 每轮穿越只会发生**一次**。
+                                self._returned = True
+                                self._returned_mono = time.monotonic()
+                                # 打印"推了多少 / 花了多久": 现场取证时这两个
+                                # 数字能直接区分"用户是故意推过去的"还是
+                                # "手一抖 / 管道滞后把指针顶出去的"。
+                                print(f"[agent] 推过回传边 {pushed}px"
+                                      f"({spent_ms:.0f}ms) -> 交回主电脑控制权",
+                                      flush=True)
+                                # ★ 控制权回到主机: 隐藏本机光标
+                                #   (主机光标恢复可见是主机侧 crossing 时做的)。
+                                if self._hider is not None:
+                                    self._hider.hide()
+                            return
+                        # 还没推够: 照常注入(系统把光标钳在墙上, 指针停在边缘)
+                        if self.DIAG_EDGE:
+                            self._diag_edge("hold", x, y, ev, self._push_acc)
+                    elif self.DIAG_EDGE:
+                        self._diag_edge("toward", x, y, ev, 0)
             if ev.type == EV_MOUSE_MOVE_REL:
                 inj.move_relative(ev.a, ev.b)
             elif ev.type == EV_MOUSE_BUTTON:
@@ -1118,6 +1174,41 @@ class Agent:
             pass
         print(f"[agent] 释放残留按键 ({reason}): "
               f"键={len(keys)} 鼠标键={len(buttons)}", flush=True)
+
+    def _overshoot_px(self, x: int, y: int, dx: int, dy: int) -> int:
+        """本次位移里**有多少像素是推过边界**的(纯函数, 可单测)。
+
+        光标已经顶在墙上时, 系统会把落点钳在边界那一列, 多出来的部分
+        在屏幕上**看不见** —— 但用户手上确实推了这么多。回传判定就看这
+        个"看不见的推距", 而不是"光标是否贴着边": 后者一点点漂移就成立,
+        正是用户报的"被吸在边上"。
+        """
+        e = self._return_edge
+        if e is None:
+            return 0
+        r = e.self_rect
+        side = e.side
+        if side == "left":
+            return max(0, r.left - (x + int(dx)))
+        if side == "right":
+            return max(0, (x + int(dx)) - (r.right - 1))
+        if side == "top":
+            return max(0, r.top - (y + int(dy)))
+        return max(0, (y + int(dy)) - (r.bottom - 1))
+
+    def _diag_edge(self, tag: str, x: int, y: int, ev, acc: int) -> None:
+        """COM_BRIDGE_DIAG_EDGE=1 时的现场取证输出(节流 20Hz)。
+
+        只在回传边附近逐事件打印, 用来还原"指针到底是被什么顶到边上的":
+        dx 小而成串 = 手在慢慢漂 / 管道在滞后; dx 大 = 用户在故意推。
+        """
+        now = time.monotonic()
+        if now - self._diag_edge_last < 0.05:
+            return
+        self._diag_edge_last = now
+        side = self._return_edge.side if self._return_edge else "?"
+        print(f"[agent][edge] {tag} 边={side} 光标=({x},{y}) "
+              f"dx={ev.a} dy={ev.b} 累计推过={acc}px", flush=True)
 
     def _is_toward_host(self, dx: int, dy: int) -> bool:
         """位移是否指向主电脑(即副电脑上的"回程方向")。"""

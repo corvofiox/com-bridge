@@ -685,7 +685,14 @@ def position_fraction(x: int, y: int, side: str) -> float:
 # 若进入点恰好在回传边上, 进入瞬间一次朝主电脑的抖动就会立刻越过回传边
 # 再次回传 —— Deskflow 在 Server.cpp 的 avoidJumpZone 里刻意把进入点向内
 # 推过跳入区, 落点与边缘之间留出死区, 用户必须真正"拉回"才触发回传。
-ENTRY_JUMP_ZONE_PX = 12
+#
+# ★ 2026-10-22 由 12 提到 24: 用户复报"副机靠主机那一侧的边缘有吸力/
+#   粘滞"。12px 的死区在真机上太薄 —— 指针一落到副机就贴在边缘, 手一点
+#   横向漂移(斜着推、或管道滞后导致手已回拉而指针还在往左走)就让回传
+#   条件成立, 回到主机后又同样落在离边 12px 处, 于是一碰就来回弹。
+#   配合 Agent.RETURN_PUSH_OUT_PX(必须再推过边界 24px 才交回), 边缘现在
+#   是"硬墙 + 需要主动顶出去", 而不是"碰到就弹"。
+ENTRY_JUMP_ZONE_PX = 24
 
 
 def _frac_to_axis(f: float, extent: int, origin: int) -> int:
