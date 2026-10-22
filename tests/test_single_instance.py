@@ -19,11 +19,40 @@ import inspect
 import os
 import subprocess
 import sys
+import uuid
+
+# ★ 审查项 #9: 用**独立互斥量名**跑这三条用例。
+#   原来用生产名, 于是"程序正在运行"时互斥量已被真实进程占着 ->
+#   test_acquire_is_idempotent / test_cross_process_is_blocked /
+#   test_released_after_release 必然失败。那不是回归, 但 CI 永远红,
+#   也容易让人以为单实例逻辑坏了。
+#   必须在 import single_instance **之前**设: MUTEX_NAME 在模块导入时求值。
+os.environ["COM_BRIDGE_MUTEX_NAME"] = (
+    "Local\\ComBridge-Test-{%s}" % uuid.uuid4())
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import com_bridge.gui as gui_mod  # noqa: E402
 import com_bridge.single_instance as si  # noqa: E402
+
+
+def test_default_name_used_when_no_override():
+    """不设环境变量时必须回到生产名(否则两个用户各跑一个的语义会变)。"""
+    code = ("import sys; sys.path.insert(0,'.');"
+            "from com_bridge import single_instance as s;"
+            "print(s.MUTEX_NAME)")
+    env = dict(os.environ)
+    env.pop("COM_BRIDGE_MUTEX_NAME", None)
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                       text=True, timeout=60, env=env,
+                       cwd=os.path.dirname(
+                           os.path.dirname(os.path.abspath(__file__))))
+    assert "SingleInstance-{6F1A2B3C" in r.stdout, r.stdout
+
+
+def test_test_run_uses_isolated_name():
+    """本测试进程必须用独立名, 否则会和正在运行的程序抢同一把锁。"""
+    assert "ComBridge-Test-" in si.MUTEX_NAME
 
 
 def test_mutex_name_is_session_local():

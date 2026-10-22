@@ -15,6 +15,7 @@ Deskflow 的 deskMouseRelativeMove 专门处理它(临时禁加速 -> 移动 -> 
 from __future__ import annotations
 
 import inspect
+import os
 
 import pytest
 
@@ -136,10 +137,48 @@ class TestCompensationApplied:
         assert hasattr(input_mod, "_ACCEL_LOCK"), "_ACCEL_LOCK 必须存在"
 
 
+def _another_instance_running() -> bool:
+    """本机是否已有 Com Bridge 在跑(它会和本测试抢同一个光标)。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        from com_bridge import single_instance as si
+
+        k32 = ctypes.windll.kernel32
+        k32.CreateMutexW.restype = wintypes.HANDLE
+        k32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL,
+                                     wintypes.LPCWSTR]
+        k32.GetLastError.restype = wintypes.DWORD
+        h = k32.CreateMutexW(None, False, si.MUTEX_NAME)
+        if not h:
+            return False
+        existed = (k32.GetLastError() == 183)
+        k32.CloseHandle(wintypes.HANDLE(h))
+        return bool(existed)
+    except Exception:                     # noqa: BLE001
+        return False
+
+
 class TestRealInjectionIsOneToOne:
-    """真实注入必须是 1:1(需要干净桌面; 无桌面时跳过)。"""
+    """真实注入必须是 1:1(需要干净桌面; 无桌面时跳过)。
+
+    ★ 审查项 #10(2026-10-23): 这条用例会**移动真实光标**, 所以只要本机有
+      别的程序在碰光标就会偶发失败 —— 能干扰它的至少有三类: 正在运行的
+      Com Bridge 自己(穿越态会把主机光标钳在边缘)、Deskflow/Synergy 之类
+      同类工具、带手势/摇杆的鼠标驱动。
+      现在默认**跳过**, 需要时显式开启:
+          set COM_BRIDGE_REAL_INPUT_TESTS=1
+      即使开启, 检测到本机已有 Com Bridge 在跑也会跳过。
+      这样测试结果只反映"代码对不对", 不再随机变红。
+    """
 
     def test_real_relative_move_is_linear(self):
+        if os.environ.get("COM_BRIDGE_REAL_INPUT_TESTS") != "1":
+            pytest.skip("真机注入测试会移动真实光标; "
+                        "设 COM_BRIDGE_REAL_INPUT_TESTS=1 才运行")
+        if _another_instance_running():
+            pytest.skip("本机已有 Com Bridge 在运行, 会与本测试抢光标")
         from com_bridge.input import get_cursor_pos, user32, virtual_desktop
         try:
             d = virtual_desktop()

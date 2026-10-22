@@ -22,7 +22,25 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
+
+# ★ 审查项 #11(2026-10-23): 日志**运行时**也要轮转。
+#   旧的实现只在启动时 `os.replace(path, path+".old")` 一次:
+#     * 只保留一份 .old, 上一次的现场会被覆盖;
+#     * 长时间不重启则完全不轮转 —— 一个跑了三天的进程能把日志写到几百 MB
+#       (用户实测单文件已经 1.5MB+), 出事时反而拖不开。
+#   现在: 超过上限就"快照 + 截断"(copytruncate)。
+#     为什么不直接 rename: 日志文件此刻正被 fd 1/2 打开, Windows 上
+#     重命名打开中的文件会失败(共享冲突); 而"复制一份 + 把 fd 截断"
+#     不需要改文件名, 也就不会被占用卡住。
+MAX_LOG_BYTES = int(os.environ.get("COM_BRIDGE_LOG_MAX") or 8 * 1024 * 1024)
+KEEP_SNAPSHOTS = 3          # 保留 .1/.2/.3 三份
+SNAPSHOT_TAIL = 512 * 1024  # 每份快照只留末尾 512KB
+ROTATE_INTERVAL_S = 30.0
+
+_rotate_thread: "threading.Thread | None" = None
+_live_path: "str | None" = None
 
 
 def _log_dir() -> str:
@@ -32,12 +50,84 @@ def _log_dir() -> str:
     return d
 
 
-def _rotate_if_big(path: str, max_bytes: int = 2 * 1024 * 1024) -> None:
+def snapshot_and_truncate(path: str, keep: int = KEEP_SNAPSHOTS,
+                          tail: int = SNAPSHOT_TAIL) -> int:
+    """把当前日志的末尾一段存成 .1, 旧快照顺移; 返回快照字节数(0=没做)。
+
+    只做文件操作, 不碰 fd 1 —— 便于单测。
+    """
     try:
-        if os.path.exists(path) and os.path.getsize(path) > max_bytes:
-            os.replace(path, path + ".old")
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size <= 0:
+                return 0
+            f.seek(max(0, size - tail))
+            data = f.read()
     except OSError:
-        pass
+        return 0
+    # 旧快照顺移: .(keep-1) -> .keep, ..., .1 -> .2 (最老的丢掉)
+    for i in range(keep - 1, 0, -1):
+        src, dst = f"{path}.{i}", f"{path}.{i + 1}"
+        try:
+            if os.path.exists(src):
+                os.replace(src, dst)
+        except OSError:
+            pass
+    try:
+        with open(path + ".1", "wb") as f:
+            f.write(data)
+    except OSError:
+        return 0
+    return len(data)
+
+
+def _truncate_live(path: str) -> bool:
+    """把正在写的日志清空。优先截断 fd 1(stdout 就指向它), 退回复写。"""
+    if _live_path == path:
+        try:
+            os.ftruncate(1, 0)          # 只在 install() 之后才这么做
+            return True
+        except OSError:
+            pass
+    try:
+        with open(path, "w", encoding="utf-8"):
+            pass
+        return True
+    except OSError:
+        return False
+
+
+def rotate_if_big(path: str, max_bytes: int | None = None) -> bool:
+    """超过上限就轮转一次(快照 + 截断)。返回是否真的轮转了。"""
+    limit = MAX_LOG_BYTES if max_bytes is None else max_bytes
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) <= limit:
+            return False
+    except OSError:
+        return False
+    if snapshot_and_truncate(path) <= 0:
+        return False
+    return _truncate_live(path)
+
+
+def _start_rotator(path: str) -> None:
+    """后台每 30 秒检查一次大小(长跑进程也能被轮转)。"""
+    global _rotate_thread
+    if _rotate_thread is not None:
+        return
+
+    def loop() -> None:
+        while True:
+            time.sleep(ROTATE_INTERVAL_S)
+            try:
+                rotate_if_big(path)
+            except Exception:            # noqa: BLE001
+                pass
+
+    _rotate_thread = threading.Thread(target=loop, daemon=True,
+                                      name="LogRotate")
+    _rotate_thread.start()
 
 
 def write_line(text: str) -> None:
@@ -118,8 +208,10 @@ def install() -> str | None:
     if sys.stdout is not None and sys.stdout.isatty():
         return None
     try:
+        global _live_path
         path = os.path.join(_log_dir(), "com-bridge-gui.log")
-        _rotate_if_big(path)
+        _live_path = path
+        rotate_if_big(path)
         # 追加一段启动分隔, 方便按会话检索
         with open(path, "a", encoding="utf-8", errors="replace") as f:
             f.write(f"\n===== session {time.strftime('%Y-%m-%d %H:%M:%S')} "
@@ -143,6 +235,7 @@ def install() -> str | None:
             sys.stderr = _TimestampedStream(io.open(
                 2, "w", encoding="utf-8", errors="replace", buffering=1,
                 closefd=False))
+        _start_rotator(path)
         return path
     except OSError:
         return None

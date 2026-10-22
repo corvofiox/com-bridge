@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 from ctypes import wintypes
 
 kernel32 = ctypes.windll.kernel32
@@ -45,7 +46,16 @@ SW_SHOW = 5
 
 # 互斥量名: 用 GUID 风格避免撞名。
 # Local\ 前缀 = 当前登录会话内唯一(不同用户各开一个是合理的)。
-MUTEX_NAME = "Local\\ComBridge-SingleInstance-{6F1A2B3C-9D4E-4F5A-8B7C-1D2E3F4A5B6C}"
+#
+# ★ 审查项 #9(2026-10-23): 名字允许用环境变量覆盖。
+#   原本是硬编码常量, 于是 `tests/test_single_instance.py` 里那三条
+#   "同进程幂等 / 跨进程被拦 / 释放后可获取"在**程序正在运行时必然失败**
+#   —— 互斥量已经被真实进程占着, 这不是回归, 但 CI 里会一直红, 而且
+#   容易让人误以为单实例坏了。测试现在各自用一个独立名字, 互不干扰。
+#   生产路径不设这个变量, 行为与之前完全一致。
+_DEFAULT_MUTEX_NAME = (
+    "Local\\ComBridge-SingleInstance-{6F1A2B3C-9D4E-4F5A-8B7C-1D2E3F4A5B6C}")
+MUTEX_NAME = os.environ.get("COM_BRIDGE_MUTEX_NAME") or _DEFAULT_MUTEX_NAME
 
 # 主窗口标题前缀(用于查找已有实例)
 WINDOW_TITLE_MARK = "Com Bridge"
