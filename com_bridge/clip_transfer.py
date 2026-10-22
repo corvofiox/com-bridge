@@ -552,9 +552,11 @@ class ClipOutbox:
                 ok, sent, msg = push_clipboard(
                     self.host, self.port, blob, entries,
                     on_progress=self._on_progress, cancel=self._cancel)
+                # ★ 先更新计数再打日志: 日志里有 print + 浮点运算,
+                #   放在计数前会让"接收端已收到 3 份"与"发送端 sent==3"
+                #   之间多出一个窗口(测试里表现为偶发 2 == 3)。
                 self._busy = False
                 self.bytes_sent += sent
-                self._log_done(ok, sent, msg)
                 if ok:
                     self.sent += 1
                 elif msg == "已取消":
@@ -562,6 +564,7 @@ class ClipOutbox:
                 else:
                     self.failed += 1
                     self.last_error = msg
+                self._log_done(ok, sent, msg)
 
 
 def push_clipboard(host: str, port: int, blob: bytes,

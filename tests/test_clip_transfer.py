@@ -279,6 +279,11 @@ def test_outbox_sends_in_order(tmp_path):
         while len(got) < 3 and time.time() < deadline:
             time.sleep(0.02)
         assert [g[cb.FMT_TEXT] for g in got] == [b"msg0", b"msg1", b"msg2"]
+        # 计数是在**对端确认之后**才加的, 与"对端已收到"之间有一个窗口,
+        # 所以这里轮询而不是立刻断言(否则偶发 2 == 3)。
+        deadline = time.time() + 5
+        while out.sent < 3 and time.time() < deadline:
+            time.sleep(0.02)
         assert out.sent == 3 and out.failed == 0
     finally:
         out.stop()
