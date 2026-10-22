@@ -27,6 +27,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from com_bridge.server import Server  # noqa: E402
 
 
+def _strip_comments(src: str) -> str:
+    """去掉注释, 只看代码本体(注释里允许记载历史与根因)。"""
+    out = []
+    for line in src.splitlines():
+        i = line.find("#")
+        out.append(line if i < 0 else line[:i])
+    return "\n".join(out)
+
+
 def test_verify_result_has_ttl():
     """自检结论必须带有效期(否则焦点变化后永远无法恢复)。"""
     assert hasattr(Server, "KBD_VERIFY_TTL_S")
@@ -48,10 +57,22 @@ def test_relay_ready_triggers_reverify():
 
 
 def test_acquire_control_forces_reverify():
-    """★ 每次穿越开始必须强制复检(不依赖 TTL)。"""
+    """★ 每次穿越开始必须强制复检(不依赖 TTL)。
+
+    ★ 2026-10-22: 复检改为**后台线程**发起 —— `probe_keyboard_hook()` 要
+      轮询等最多 0.5s, 而 `_acquire_control` 跑在原始输入回调线程上, 同步
+      调用会把每次越界的输入管线堵住半秒(用户体感: 指针先僵住再猛窜)。
+      所以断言链路变成: _acquire_control → _kick_kbd_verify → 后台线程里
+      跑 _reverify_keyboard_hook。
+    """
     src = inspect.getsource(Server._acquire_control)
-    assert "_reverify_keyboard_hook" in src, \
+    assert "_kick_kbd_verify" in src, \
         "穿越开始是最需要键盘可用的时刻, 必须复检"
+    assert "_reverify_keyboard_hook()" not in _strip_comments(src), \
+        "不得在输入线程上同步等探针"
+    kick = inspect.getsource(Server._kick_kbd_verify)
+    assert "_reverify_keyboard_hook" in kick
+    assert "_spawn_kbd_verify" in kick
 
 
 def test_reverify_updates_on_success():

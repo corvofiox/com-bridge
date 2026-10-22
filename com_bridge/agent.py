@@ -139,6 +139,13 @@ class Agent:
     # 容忍 4 次丢失(server.PEER_LOSS_S 同款阈值)。
     STUCK_KEY_AFTER_S = 5.0
 
+    # 回传之后**丢弃陈旧位移**的时长上限(秒), 见 _on_input_event 的回传去抖。
+    # 取值依据(副机真机日志, 2026-10-22): 同一手势最多在 42ms 内触发 145 次
+    # 回传, 即管线里积压了 145 个事件; 1000Hz 鼠标下约 0.15s, 500Hz 下约
+    # 0.3s。取 0.35s 能覆盖实测最坏情况, 又短到"万一下次交接在这期间发生
+    # (用户故意甩回去)"不会误丢。
+    RETURN_STALE_DRAIN_S = 0.35
+
     def __init__(self, server_host: str | None = None, name: str = "agent",
                  mute_local: bool = True, discover_timeout_s: float = 3.0,
                  prefer_rate: int = 48000, control_port: int | None = None,
@@ -187,6 +194,10 @@ class Agent:
         self._return_edge = None
         # 本轮穿越是否已发过回程方位(见 _on_input_event 的"只发一次"说明)
         self._return_place_sent = False
+        # 本轮穿越是否**已经把控制权交回主电脑**(回传去抖, 见 _on_input_event)
+        self._returned = False
+        # 交回那一刻的单调时间(RETURN_STALE_DRAIN_S 的起点)
+        self._returned_mono = 0.0
         # 已发出的打洞心跳数(GUI 用它确认打洞在持续进行)
         self._punch_heartbeats = 0
         self._adv_host: str | None = None
@@ -917,6 +928,8 @@ class Agent:
                     self._return_edge.reset()   # 交接后从干净状态开始判定
                 # 新一轮穿越: 允许再发一次回程方位(见 _on_input_event 的闸门)
                 self._return_place_sent = False
+                # 新一轮穿越: 解除"已交回控制权"的去抖锁(同上)
+                self._returned = False
                 d = virtual_desktop()
                 # ★ 主机光标进入: 恢复本机光标可见(它就是当前活动光标)。
                 #   若之前回传时隐藏了, 这里必须恢复 —— 否则用户在副机上
@@ -968,6 +981,33 @@ class Agent:
                 #   副机上正常向左移动 0.7 秒就被拽回主机, 双屏时尤其明显
                 #   (桌面宽 3840, 向左移动几乎必然超过 0.7 秒)。
                 #   现在绝对定位已实现, 时间条件可以而且应该去掉。
+                # ★★★ 回传去抖(2026-10-22 修, 副机真机日志实证):
+                #   一抵边就把控制权交回主机, 但**管线里还堵着一批旧位移**
+                #   —— 那些事件是主机在我们回传之前就已经发出来的。
+                #   实测(同一手势): 42ms 内触发 **145 次**回传, 说明副机当时
+                #   积压了 145 个事件(≈0.15~0.3s 的滞后)。这带来两个恶果:
+                #     ① 每个事件都会重新 hide() 一次。hider 单次 hide ≈ 50ms
+                #        (全屏定位 + 抢前台 + 抓捕获 + 两次 ±1px 注入 +
+                #        两个 sleep), 145 次 ≈ 7 秒 —— 这期间副机的 hider
+                #        线程一直在重设前台/捕获, 重新进入时 show() 排在
+                #        几十个 hide() 后面, 光标迟迟不出现; 出现时又被
+                #        绝对定位回边缘 12px 处。主观上就是"指针被吸在边上、
+                #        拉不出来"。
+                #     ② 那 145 条位移还要逐个回传给主机再注入一遍。可主机
+                #        那边早已用自己的物理鼠标实时走过同样的路程, 而回程
+                #        本身是**绝对定位**的 —— 重复注入等于把手速放大两倍,
+                #        指针在回程瞬间猛窜一段。
+                #   所以: 同一轮穿越**只回传一次**, 之后积压的陈旧位移一律
+                #   丢弃(它们比真实时间晚, 重放只会制造错误)。
+                if self._returned:
+                    if (time.monotonic() - self._returned_mono
+                            < self.RETURN_STALE_DRAIN_S):
+                        self.stats["events_dropped_stale"] = \
+                            self.stats.get("events_dropped_stale", 0) + 1
+                        return
+                    # 兜底: 回程包万一丢了(主机没接管), 冷静期一过就恢复
+                    # 正常注入 —— 否则副机会**永久吞掉**输入, 用户彻底失控。
+                    self._returned = False
                 toward_host = self._is_toward_host(ev.a, ev.b)
                 if toward_host:
                     x, y = get_cursor_pos()
@@ -991,6 +1031,10 @@ class Agent:
                             self._input_tx.send(ev)
                             self.stats["events_returned"] = \
                                 self.stats.get("events_returned", 0) + 1
+                            # 去抖锁: 本条之后的积压位移一律丢弃, 因此下面
+                            # 的日志与 hide() 每轮穿越只会发生**一次**。
+                            self._returned = True
+                            self._returned_mono = time.monotonic()
                             print("[agent] 光标离开回传边 -> 交回主电脑控制权",
                                   flush=True)
                             # ★ 控制权回到主机: 隐藏本机光标

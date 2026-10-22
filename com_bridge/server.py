@@ -237,6 +237,11 @@ class Server:
         self._kbd_hook_verified: bool | None = None
         # 上次自检的时间(结论有效期见 KBD_VERIFY_TTL_S)
         self._kbd_verify_mono = 0.0
+        # 异步自检线程(见 _kick_kbd_verify): 绝不让探针的 0.5s 等待
+        # 发生在输入线程上
+        self._kbd_verify_thread: threading.Thread | None = None
+        # 启动自检线程的锁: 探针会改全局计数, 两个并发探针会互相污染判据
+        self._kbd_verify_lock = threading.Lock()
         # 键盘钩子自愈(见 _kbd_heal_loop): 同一时刻只允许一轮在跑
         self._kbd_healing = False
         self._kbd_heal_lock = threading.Lock()
@@ -1733,13 +1738,30 @@ class Server:
         #   GUI 启动时窗口有焦点(自检必然失败), 之后 GUI 放弃焦点才恢复;
         #   若只信启动时的结论, 键盘会一直被误禁用(上一版的回归:
         #   用户报"键盘跨屏完全失效")。
-        #   复检很便宜(一次注入 + 最多 0.5s 等待), 且只发生在穿越瞬间。
-        try:
-            self._reverify_keyboard_hook()
-        except Exception:  # noqa: BLE001
-            pass
+        #
+        # ★★★ 但必须**异步**做(2026-10-22 修, 竞态实测):
+        #   本方法运行在**原始输入回调线程**上(越界判定 -> _acquire_control)。
+        #   而 `probe_keyboard_hook()` 要注入一个探针键并**轮询等最多 0.5s**。
+        #   同步调用等于每次越界都把主机的输入线程堵住最多半秒: 期间物理
+        #   鼠标的 RawInput 事件全在窗口队列里排队, 堵完后一次性倒给副机
+        #   —— 副机看到的是"指针先僵住、然后猛地窜一段", 一串陈旧位移
+        #   把光标怼到回传边上 -> 立刻被交回主机。用户报的"指针被往主机
+        #   那一侧边缘吸"主要就是这条链。
+        #   异步不影响判定: 穿越期间是否转发键盘由 `_keyboard_relay_ready`
+        #   的"hider 已隐藏"分支直接放行, 不依赖本结论; 本结论只用于
+        #   **非穿越期**的泄漏判断(它有 KBD_VERIFY_TTL_S 有效期, 到点自会重测)。
+        self._kick_kbd_verify()
         if self._hider is not None:
             self._hider.hide()
+
+    def _kick_kbd_verify(self) -> None:
+        """在后台线程里复核键盘钩子(绝不在输入线程上阻塞)。
+
+        同一时刻只允许一个在跑: `probe_keyboard_hook` 的注入会改动全局计数,
+        两个线程同时探针会互相干扰(把 `before` 快照算错, 误报"可达")。
+        """
+        self._spawn_kbd_verify(self._reverify_keyboard_hook)
+
 
     def _release_control(self) -> None:
         """交还控制权: **立刻放行**本机物理输入, 并恢复光标。
@@ -1750,33 +1772,55 @@ class Server:
         """
         if self._hook is not None:
             self._hook.set_relay(False)
-            # ★★ 交还前的**键盘钩子复核**(补两道检测都够不着的盲区):
-            #   用户拿回控制权之前, 先用探针确认键盘回调还活着。
-            #   为什么必须在这里做: 穿越期间键盘钩子死亡的两条路
-            #   —— 被系统静默摘除(约 300ms 超时, 句柄不置空) /
-            #      被别的程序先吞掉(键到不了我们, RawInput 也看不到)
-            #   —— 都**不会**触发现有检测(鼠标自检看的是光标位移,
-            #   只有鼠标钩子死了才报警; 泄漏检测要 RawInput 键盘事件,
-            #   而键被别人吞掉时 RawInput 根本收不到)。于是用户穿越时
-            #   "键同时落两台", 退回后日志里却**一个字都没有**。
-            #   在交还这一刻(穿越结束, 每轮必经)复核一次, 失败就重装,
-            #   至少保证**下一轮**穿越是好的; 重装只在交还时做, 穿越中
-            #   不做(避免打断用户输入)。
-            self._verify_kbd_on_release()
+        # ★★★ 先恢复光标, **再**去复核键盘钩子(2026-10-22 修):
+        #   探针要注入一个键并轮询等结果(最多 0.5s, 实测常在 10~20ms)。
+        #   它原先卡在这里同步执行, 于是**每次交还控制权, 光标都要多等
+        #   一次探针才显示、回程绝对定位也被推迟** —— 用户看到的是
+        #   "已经推回来了, 指针却愣一下才出现"。
+        #   而且探针的判据与"本进程窗口是不是前台"强相关, 在 hider 还
+        #   占着前台时问它, 结论本身就不可信。放到恢复光标之后、后台线程
+        #   里问, 三个问题一起解决。
         self._show_cursor()
+        self._verify_kbd_on_release()
 
     def _verify_kbd_on_release(self) -> None:
-        """交还控制权时复核键盘钩子; 失败则重装一次(下一轮穿越生效)。
+        """交还控制权后**在后台**复核键盘钩子; 失败则重装一次(下一轮生效)。
 
         ★ 探针判据(`probe_keyboard_hook`)不依赖用户打字: 注入一个带
           TAG 的 0xE8(未分配虚拟键, 无字符/无指示灯副作用), 看**自己的
           回调**能否看到它。TAG 分支在任何过滤之前, 所以回调活着就计数。
           返回 None(注入本身失败)时**不报警** —— 判据不可用时不制造噪声。
+
+        ★ 为什么要复核(历史原因保留): 穿越期间键盘钩子死亡的两条路 ——
+          被系统静默摘除(约 300ms 超时, 句柄不置空) / 被别的程序先吞掉
+          (键到不了我们, RawInput 也看不到) —— 都不会触发现有检测, 于是
+          用户穿越时"键同时落两台", 退回后日志里却一个字都没有。
         """
         if self._hook is None or not self._hook.installed:
             return
+        self._spawn_kbd_verify(self._verify_kbd_on_release_now)
+
+    def _spawn_kbd_verify(self, target) -> None:
+        """起一个后台自检线程(同一时刻只允许一轮)。"""
+        with self._kbd_verify_lock:
+            t = self._kbd_verify_thread
+            if t is not None and t.is_alive():
+                return          # 已有一轮在跑: 同一时刻只需要一个结论
+            t = threading.Thread(target=target, daemon=True,
+                                 name="KbdHookVerify")
+            self._kbd_verify_thread = t
+            t.start()
+
+    def _verify_kbd_on_release_now(self) -> None:
+        """`_verify_kbd_on_release` 的实际工作体(后台线程入口)。"""
+        # 稍等焦点归还: hider 收起前台是异步的(消息投递到 hider 线程),
+        # 探针在"本进程仍占前台"时必然问出假失败。
+        time.sleep(0.15)
+        h = self._hook
+        if h is None or not h.installed:
+            return
         try:
-            probe = self._hook.probe_keyboard_hook()
+            probe = h.probe_keyboard_hook()
         except Exception:  # noqa: BLE001
             return
         if probe is False:
@@ -1786,7 +1830,7 @@ class Server:
                   "键盘钩子\n"
                   "         (Deskflow/Synergy/输入法热键/宏工具) —— "
                   "请让它退出, 或以管理员运行 Com Bridge。", flush=True)
-            self._hook.request_reinstall()
+            h.request_reinstall()
 
     def _ensure_hook(self) -> None:
         """安装低级钩子; 失败则退化为"每事件注入钉住"的旧路径。

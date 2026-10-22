@@ -265,19 +265,29 @@ class TestBug1CallbackStaysCheap:
         用户实测正是 (b): "鼠标有数字 键盘0 回调0", 且两台同时生效,
         而日志里一个字都没有。
         修法: _release_control(每轮穿越必经)里 probe 一次, 失败重装。
+
+        ★ 2026-10-22 调整: 探针改为**后台线程**执行(见
+          Server._spawn_kbd_verify), 因为它要轮询等最多 0.5s, 同步跑会
+          把交还路径(恢复光标 + 回程绝对定位)整体推迟。判据本身不变,
+          所以这里改为断言"交还路径会排一轮自检" + "自检工作体确实探针
+          并在 False 时重装"。
         """
         src = _strip_comments(inspect.getsource(Server._release_control))
         assert "_verify_kbd_on_release" in src, \
             "交还控制权时必须复核键盘钩子(唯一的每轮必经点)"
         v = _strip_comments(inspect.getsource(Server._verify_kbd_on_release))
-        assert "probe_keyboard_hook" in v, "必须用探针判据, 不依赖用户打字"
-        assert "request_reinstall" in v, "失败必须重装一次(下一轮生效)"
+        assert "_spawn_kbd_verify" in v, "必须在后台线程里复核, 不能阻塞交还"
+        body = _strip_comments(
+            inspect.getsource(Server._verify_kbd_on_release_now))
+        assert "probe_keyboard_hook" in body, "必须用探针判据, 不依赖用户打字"
+        assert "request_reinstall" in body, "失败必须重装一次(下一轮生效)"
         assert "return" in v and "installed" in v, \
             "钩子未装时必须早退, 不能在残骸上探测"
 
     def test_release_probe_does_not_alarm_on_none(self):
         """探针返回 None(注入本身失败)时不得报警 —— 判据不可用不制造噪声。"""
-        v = _strip_comments(inspect.getsource(Server._verify_kbd_on_release))
+        v = _strip_comments(
+            inspect.getsource(Server._verify_kbd_on_release_now))
         # 结构上: 只有 probe is False 分支里才有报警/重装
         assert "probe is False" in v
 

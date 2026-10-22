@@ -584,6 +584,19 @@ class CursorHider:
             return False
 
     def _do_hide(self) -> None:
+        """隐藏光标(幂等)。
+
+        ★★★ 幂等是**必须**的(2026-10-22 修, 真机日志实证):
+          此前每次 hide() 都无条件重走整套流程 —— 全屏 SetWindowPos +
+          SetTimer + SetCapture + 抢前台 + 两次 ±1px 注入 + 两个 sleep,
+          单次 ≈ 50ms。而副机的回传分支此前会对着同一批积压事件连续
+          hide() 上百次(实测一次跨界 145 次), hider 线程要排 **7 秒**
+          才轮得到后面的 show() —— 用户看到的就是"光标很久不出现,
+          出现时又贴在边缘"。保活定时器(每 100ms)本来就负责维持隐藏
+          状态, 重复 hide() 没有任何额外收益。
+        """
+        if self._shown:
+            return
         from .input import get_cursor_pos
         # 新一轮穿越: 刹车复位(上一轮放弃过不代表这一轮也抢不到)
         self._give_up_steal = False
