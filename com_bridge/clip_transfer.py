@@ -37,6 +37,7 @@ Deskflow 的剪贴板走它那条 **TCP 客户端流**, 分块参数在
 """
 from __future__ import annotations
 
+import io
 import os
 import socket
 import struct
@@ -58,6 +59,8 @@ K_FILE_START = 4
 K_FILE_DATA = 5
 K_FILE_END = 6
 K_DONE = 7
+# 接收端专用: 对端在 K_DONE 之前断开(主动中止, 非协议错误)
+ABORTED_NOTE = "对端中止传输(未完成)"
 K_ACK = 8
 
 # 上限: 图片(裸 DIB)可以很大; 文件总量远大于剪贴板内容。两者都要有明确口径,
@@ -316,7 +319,11 @@ class ClipInbox(_BoundThread):
             while True:
                 fr = read_frame(conn)
                 if fr is None:
-                    self.last_error = "帧读取失败"
+                    # ★ 没有 K_DONE 就断了 = 对端**主动中止**了本次传输
+                    #   (典型原因: 源文件在采样之后被用户剪切/移走/删除)。
+                    #   这是我们自己的正常退路, 不是协议错误 —— 记成信息,
+                    #   不要用 "[clip] !!" 吓用户(2026-10-25)。
+                    self.last_error = ABORTED_NOTE
                     break
                 kind, payload = fr
                 if kind == K_CLIP_START:
@@ -402,7 +409,10 @@ class ClipInbox(_BoundThread):
                 #   看到连接被重置, 日志里就成了含糊的"对端没有确认"(实测)。
                 #   这里先短时间把对端数据读掉再关, 让 ACK 能正常送达。
                 _drain(conn)
-                if self.last_error:
+                if self.last_error == ABORTED_NOTE:
+                    print(f"[clip] {self.last_error}（半截数据已丢弃）",
+                          flush=True)
+                elif self.last_error:
                     print(f"[clip] !! 接收失败: {self.last_error}", flush=True)
         finally:
             if cur_fh is not None:
@@ -567,6 +577,53 @@ class ClipOutbox:
                 self._log_done(ok, sent, msg)
 
 
+# FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+_FILE_SHARE_ALL = 0x1 | 0x2 | 0x4
+_GENERIC_READ = 0x80000000
+_OPEN_EXISTING = 3
+_FILE_ATTRIBUTE_NORMAL = 0x80
+
+
+def open_shared_read(path: str):
+    """以"读写删全共享"方式以二进制读打开文件。
+
+    ★★★ 为什么不能用 `open()`(2026-10-25 用户实测报障):
+      用户剪切文件、粘贴到本机另一个目录, 移动失败并提示文件被占用 ——
+      而那是**纯本机操作**。原因是我们正在把该文件发给对端: Python 的
+      `open()` 在 Windows 上共享 READ|WRITE 但**不共享 DELETE**, 而同卷
+      移动就是 rename, 需要 DELETE 权限, 于是资源管理器被拒(WinError 32)。
+
+      实测: 普通 open() 期间 os.replace -> PermissionError 32;
+            全共享打开期间 os.replace -> 成功, 且移动后仍能从原句柄读完
+            (句柄跟着文件走, 不因改名失效)。
+
+    失败时退回普通 open(): 宁可短暂占用文件, 也不能让传输整个做不了。
+    """
+    if os.name != "nt":
+        return open(path, "rb")
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        k32 = ctypes.windll.kernel32
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        h = k32.CreateFileW(path, _GENERIC_READ, _FILE_SHARE_ALL, None,
+                            _OPEN_EXISTING, _FILE_ATTRIBUTE_NORMAL, None)
+        invalid = wintypes.HANDLE(-1).value
+        if not h or int(h) == int(invalid):
+            return open(path, "rb")
+        # open_osfhandle 接管句柄所有权: 关文件对象即关句柄, 不要重复 CloseHandle
+        fd = msvcrt.open_osfhandle(int(h), os.O_RDONLY | os.O_BINARY)
+        return io.open(fd, "rb", closefd=True)
+    except Exception:  # noqa: BLE001
+        return open(path, "rb")
+
+
 def push_clipboard(host: str, port: int, blob: bytes,
                    entries: list[dict] | None = None,
                    timeout: float = ACK_TIMEOUT_S,
@@ -625,8 +682,14 @@ def push_clipboard(host: str, port: int, blob: bytes,
             size = int(e.get("size", 0))
             if not src:
                 return False, sent, f"缺少源路径: {e.get('name')}"
+            if not os.path.exists(src):
+                # 用户可能已经把这个文件移走/删掉了(剪切粘贴)。此时**不要**
+                # 发半截: 直接整批失败并说清原因, 对端不会落地半个文件。
+                return False, sent, (
+                    f"源文件已不存在(可能被移动或删除): {e.get('name') or src}")
             send_frame(sock, K_FILE_START, struct.pack("<HQ", idx, size))
-            with open(src, "rb") as fh:
+            # ★ 全共享打开: 传输期间用户仍可剪切/移动/删除这个文件
+            with open_shared_read(src) as fh:
                 left = size
                 while left > 0:
                     if _tick():

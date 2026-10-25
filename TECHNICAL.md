@@ -528,6 +528,23 @@ Windows 服务跑在 **Session 0**, 那里没有交互桌面: 拿不到光标坐
 等价且正确的做法是**登录触发的计划任务 + RunLevel Highest**,
 程序里已有这个开关(`elevated.py`)。
 
+### 发送文件必须"全共享"打开, 否则会挡住用户的剪切/移动(2026-10-25)
+
+`push_clipboard()` 原来用 `open(src, "rb")` 读源文件。Python 在 Windows 上以
+`_SH_DENYNO` 打开, 共享 READ|WRITE, **不含 DELETE**; 同卷移动 = rename, 需要
+DELETE 权限 -> 传输期间资源管理器报"文件正在使用"(WinError 32)。
+
+实测(本机):
+
+| 打开方式 | 传输期间 `os.replace` |
+| --- | --- |
+| 普通 `open()` | `PermissionError [WinError 32]` |
+| `FILE_SHARE_READ|WRITE|DELETE` | 成功, 且移动后仍能从原句柄读完 |
+
+因此改用 `CreateFileW` + `msvcrt.open_osfhandle`(见 `clip_transfer.open_shared_read`),
+整套属性: 全共享、句柄随文件走(改名后继续读同一份数据)、失败退回普通 `open`。
+配套: 源文件在采样后消失时**整批中止**(不留半截文件); 接收端把"对端中止"记为信息而非错误。
+
 ## 已知限制
 
 * 仅在**单机自环**下验证过全部纯逻辑单元; 双机端到端(真实网络延迟、晶振偏差、UIPI/权限差异)已在用户的两台真机上长期运行(音频到达率 48kHz、输入转发与会话锁均实测), **但"另一套 KVM/远控软件同装"的场景仍未覆盖** —— 见下条。

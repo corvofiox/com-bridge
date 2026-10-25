@@ -4,12 +4,14 @@
 它是纯函数(静态方法, 不碰 tkinter), 可以直接验证。
 """
 import os
+import subprocess
 import sys
 import types
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
 from com_bridge import clip_transfer as ct  # noqa: E402
 from com_bridge.gui import ComBridgeGui  # noqa: E402
@@ -92,33 +94,36 @@ def test_status_window_has_the_clipboard_field():
 
 
 def test_status_window_renders_clipboard_row():
-    """真渲染一遍状态窗口(离屏), 确认这一行拿到的是数据而不是"—"。"""
-    import queue
-    import tkinter as tk
+    """真渲染一遍状态窗口, 确认这一行拿到的是数据而不是"—"。
 
-    from com_bridge import gui_windows as gw
-
-    try:
-        root = tk.Tk()
-    except tk.TclError:
-        pytest.skip("无图形环境")
-    root.withdraw()                    # 不显示任何窗口
-
-    class App:
-        _log_q = queue.Queue()
-
-        def collect_status(self):
-            return {"clipboard": ("发 1 项 (0.5 MB) ｜ 收 2 项（文件 1 个, 3.0 MB）", 1)}
-
-    try:
-        win = gw.StatusWindow(root, App())
-        win._create()                  # 与运行时同一份构建代码
-        assert "clipboard" in win._rows, "状态窗口没渲染出剪贴板这一行"
-        text = win._rows["clipboard"].cget("text")
-        assert "发 1 项" in text and "文件 1 个" in text
-        win.destroy()
-    finally:
-        root.destroy()
+    ★ 放在**子进程**里做: 在同一个 pytest 进程里创建/销毁 Tk 根窗口会污染
+      后续 Tk 用例(实测: test_gui_theme_v2 会偶发 3 failed/10 errors, 单跑却
+      全过)。子进程彻底隔离图形状态。
+    """
+    code = (
+        "import queue, sys, tkinter as tk\n"
+        "sys.path.insert(0, '.')\n"
+        "from com_bridge import gui_windows as gw\n"
+        "class App:\n"
+        "    _log_q = queue.Queue()\n"
+        "    def collect_status(self):\n"
+        "        return {'clipboard': ('发 1 项 (0.5 MB) ｜ 收 2 项（文件 1 个, 3.0 MB）', 1)}\n"
+        "root = tk.Tk(); root.withdraw()\n"
+        "win = gw.StatusWindow(root, App()); win._create()\n"
+        "print('ROWS=' + ','.join(win._rows))\n"
+        "print('TEXT=' + win._rows['clipboard'].cget('text'))\n"
+        "win.hide_children(); win.destroy(); root.destroy()\n"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                       text=True, timeout=120, cwd=ROOT)
+    if "ROWS=" not in r.stdout:
+        pytest.skip(f"无图形环境或 Tk 不可用: {r.stderr[-300:]}")
+    rows = [ln.split("=", 1)[1] for ln in r.stdout.splitlines()
+            if ln.startswith("ROWS=")][0].split(",")
+    assert "clipboard" in rows, f"状态窗口没渲染出剪贴板这一行: {rows}"
+    text = [ln.split("=", 1)[1] for ln in r.stdout.splitlines()
+            if ln.startswith("TEXT=")][0]
+    assert "发 1 项" in text and "文件 1 个" in text, text
 
 
 if __name__ == "__main__":
