@@ -142,10 +142,18 @@ def test_sinc_no_block_boundary_overshoot():
 # --- 3. 重连间隔 ------------------------------------------------------
 
 def test_reconnect_backoff_capped_at_5s():
-    """★ 重连退避上限必须是 5s(用户要求: 30s 太长)。"""
+    """★ 重连间隔**恒定 5s**（用户 2026-10-19: "30s 太长"；2026-10-26: "不是每 5 秒么"）。
+
+    历史上这里是 2→4→5 的指数退避，上限 5s —— 但"上限 5s"不等于"每 5s"：
+    连接尝试本身还会阻塞（`ControlClient` 默认 5s 超时），叠加后实测间隔
+    6.5~10s。现在改为固定值 `HOST_RETRY_INTERVAL_S`，探测用 1s 短超时。
+    """
     src = inspect.getsource(agent_mod.Agent._resync_loop)
-    assert "min(backoff * 2, 5.0)" in src, "上限应为 5.0"
+    assert "HOST_RETRY_INTERVAL_S" in src, "必须用固定的探测间隔常量"
+    assert "backoff * 2" not in src, "不要指数退避：会超过 5 秒"
     assert "30.0" not in src, "不得再有 30s 上限"
+    assert agent_mod.Agent.HOST_RETRY_INTERVAL_S <= 5.0
+    assert agent_mod.Agent.PROBE_CONNECT_TIMEOUT_S <= 1.0
 
 
 # --- 4. 焦点监控覆盖所有窗口 ------------------------------------------

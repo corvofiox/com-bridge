@@ -499,12 +499,55 @@ class ComBridgeGui:
             pass
         self.root.after(200, self._refresh_elev_state)
 
+        # 开机自启静默修复: 旧版注册的计划任务缺 --autostart, 登录后会弹窗口
+        self._selfheal_elevated_autostart()
+
         # 自动更新检查(审查项 #7): 后台查一次, 有新版本就把底栏提示换成
         # 可点击的下载链接。只在**有新版本**时才动界面 —— 查不到
         # (离线/限流/GitHub 不通)完全静默, 绝不在界面上留红字。
         self._start_update_check()
 
     # -- 自动更新检查 --------------------------------------------------
+
+    def _selfheal_elevated_autostart(self) -> None:
+        """把旧的"会弹窗口"的管理员自启任务就地升级成静默启动。
+
+        2026-10-26 用户报障: 开机自启弹 GUI。原因是 elevated._exe_path() 当初
+        只注册了 `gui` 子命令, 没带 --autostart。**已注册的任务不会自己变**,
+        所以这里做一次自愈:
+
+        ★ 只有**本进程已是管理员**时才动手 —— 那说明我们正是被那个最高权限
+          任务拉起来的, 改写任务不需要再弹 UAC; 否则(普通权限)只记一行日志,
+          提示用户重新点一次「开机自启（管理员）」。
+        ★ 全部在后台线程做: schtasks 查询要 ~0.2s, 不能拖慢启动。
+        """
+        import threading
+
+        def run() -> None:
+            try:
+                from . import elevated
+                silent = elevated.task_is_silent()
+                if silent is None or silent is True:
+                    return                      # 没有任务 / 已经是静默
+                if not elevated.is_elevated():
+                    self._log_q.put(
+                        "[gui] 管理员自启任务是旧版登记的(会弹窗口)；"
+                        "重新点一次「开机自启（管理员）」即可升级为静默")
+                    return
+                rc = elevated._do_register()
+                if rc == 0:
+                    self._log_q.put(
+                        "[gui] 管理员自启任务已升级为静默启动(下次开机不再弹窗口)")
+                    print("[gui] 管理员自启任务已升级: 动作参数补上 --autostart",
+                          flush=True)
+                else:
+                    self._log_q.put(
+                        f"[gui] !! 管理员自启任务升级失败(退出码 {rc})")
+            except Exception:                   # noqa: BLE001
+                pass
+
+        threading.Thread(target=run, daemon=True,
+                         name="SelfHealAutostart").start()
 
     def _start_update_check(self) -> None:
         """后台线程查一次更新(不阻塞界面, 失败静默)。"""

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import subprocess
 import sys
 import time
 
@@ -100,7 +101,6 @@ def _query_task_real(timeout: float = 0.35) -> bool:
     ★ timeout 给得很小: schtasks 正常情况下 15~30ms 就返回; 若它卡住,
       说明系统调度服务有问题 —— 此时宁可判"未知(False)"也不要冻界面。
     """
-    import subprocess
     try:
         r = subprocess.run(
             ["schtasks", "/Query", "/TN", TASK_NAME],
@@ -152,7 +152,6 @@ def _powershell(script: str) -> int:
       参数不合法 全都长得一样)。
     """
     global LAST_ERROR
-    import subprocess
     LAST_ERROR = ""
     # ★ 让 PowerShell 用 UTF-8 输出: 否则中文 Windows 上 stderr 是 GBK,
     #   我们按 UTF-8 解码会得到乱码("�ܾ�����"), 用户看不到真实原因。
@@ -197,21 +196,60 @@ def _powershell(script: str) -> int:
 LAST_ERROR = ""
 
 
+# ★★★ 计划任务的动作参数必须带静默标志(2026-10-26 用户报障):
+#   "开机自启没有后台静默, 而是前台弹出 GUI"。
+#   原因: 这里原来只注册 `gui` 子命令, **没有 --autostart** —— 任务拉起时程序
+#   走"正常启动"分支, 于是登录后直接把窗口怼到用户面前。
+#   HKCU\...\Run 那条路一直是对的(autostart._with_flag 会补标志), 只有计划
+#   任务这条漏了。
+SILENT_ARG = "--autostart"
+
+
 def _exe_path() -> tuple[str, str]:
     """返回 (exe, 默认参数) —— 计划任务的动作项。
 
-    打包场景: dist 里的 com-bridge-gui.exe, 参数 "gui"。
-    源码场景: python.exe, 参数 '-m com_bridge.gui' —— exe 路径里可能
-    有空格, 由 _do_register 负责加引号。
+    打包场景: dist 里的 com-bridge-gui.exe, 参数 "gui --autostart"。
+    源码场景: python.exe, 参数 '-m com_bridge.gui --autostart' —— exe 路径里
+    可能 有空格, 由 _do_register 负责加引号。
     """
     if getattr(sys, "frozen", False):
-        return os.path.abspath(sys.executable), "gui"
+        return os.path.abspath(sys.executable), "gui " + SILENT_ARG
     here = os.path.dirname(os.path.abspath(__file__))
     dist = os.path.join(os.path.dirname(here), "dist", "com-bridge-gui.exe")
     if os.path.exists(dist):
-        return dist, "gui"
+        return dist, "gui " + SILENT_ARG
     # 源码兜底: 用当前解释器跑模块(任务只在本机有效, 开发场景够用)
-    return sys.executable, "-m com_bridge.gui"
+    return sys.executable, "-m com_bridge.gui " + SILENT_ARG
+
+
+def task_action_args() -> str | None:
+    """读现有计划任务的**动作参数**(判断是否为静默自启)。失败返回 None。
+
+    ★ 只在启动时后台调用一次(子进程 ~0.2s), 不进任何热路径。
+      `/XML ONE` 的输出里只有一个 <Arguments> 节点。
+    """
+    try:
+        r = subprocess.run(
+            ["schtasks", "/Query", "/TN", TASK_NAME, "/XML", "ONE"],
+            capture_output=True, timeout=4.0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if r.returncode != 0:
+            return None
+        text = r.stdout.decode("utf-8", "replace")
+        if "<Arguments>" not in text:
+            return ""
+        return text.split("<Arguments>", 1)[1].split("</Arguments>", 1)[0]
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def task_is_silent() -> bool | None:
+    """计划任务的动作带静默标志吗? None = 查不到(任务不存在/查询失败)。"""
+    args = task_action_args()
+    if args is None:
+        return None
+    return SILENT_ARG in args.split()
 
 
 def _ps_quote(s: str) -> str:
@@ -219,11 +257,27 @@ def _ps_quote(s: str) -> str:
     return "'" + s.replace("'", "''") + "'"
 
 
+def _full_user(env: dict | None = None) -> str:
+    """当前账户的完整名(域\\用户), 用于计划任务主体。纯函数, 便于单测。
+
+    ★★★ 为什么不能直接用 USERDOMAIN(2026-10-26 实测踩到):
+      工作组机器上 `USERDOMAIN` 是 **"WORKGROUP"** —— 拿它拼
+      `New-ScheduledTaskPrincipal -UserId` 会注册失败:
+          HRESULT 0x80070534 "账户名与安全标识间无任何映射"
+      本地账户的真实域是**计算机名**(如 CORVO-LAPTOP\\gaoxi)。
+      所以域为 WORKGROUP(或空)时退回 COMPUTERNAME。
+    """
+    env = os.environ if env is None else env
+    user = env.get("USERNAME", "") or ""
+    dom = env.get("USERDOMAIN", "") or ""
+    if not dom or dom.upper() == "WORKGROUP":
+        dom = env.get("COMPUTERNAME", "") or ""
+    return f"{dom}\\{user}" if dom and user else user
+
+
 def _do_register() -> int:
     exe, exe_args = _exe_path()
-    user = os.environ.get("USERNAME", "")
-    dom = os.environ.get("USERDOMAIN", "")
-    full_user = f"{dom}\\{user}" if dom and user else user
+    full_user = _full_user()
     # PowerShell 里路径可能带引号(源码场景), 直接内插进脚本
     script = (
         f"$ErrorActionPreference='Stop';"

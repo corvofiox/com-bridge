@@ -811,9 +811,16 @@ class InputReceiver(_BoundThread):
 class ControlClient:
     """TCP 控制通道: 时钟同步 + 文本消息。"""
 
-    def __init__(self, host: str, port: int = CONTROL_PORT, timeout: float = 5.0):
+    def __init__(self, host: str, port: int = CONTROL_PORT,
+                 timeout: float = 5.0, connect_timeout: float | None = None):
         self.addr = (host, port)
         self.timeout = timeout
+        # ★ connect_timeout 只作用于"连上并握手"这一段(2026-10-26):
+        #   主机还没监听端口时, create_connection 会**阻塞到超时**(默认 5s),
+        #   上层的退避再叠 5s, 实际探测间隔就成了 6.5~10s —— 用户实测报
+        #   "握手太慢, 我不是要求每 5 秒一次吗"。探测阶段用短超时,
+        #   握手成功后立刻恢复成正常超时(timeout), 不影响后续收发。
+        self.connect_timeout = float(connect_timeout or timeout)
         self._sock: socket.socket | None = None
         self.clock = ClockSync()
         # 连接建立后本端使用的地址 (ip, port)。**这是最可靠的本机地址** ——
@@ -826,8 +833,9 @@ class ControlClient:
 
     def connect(self) -> bool:
         try:
-            s = socket.create_connection(self.addr, timeout=self.timeout)
-            s.settimeout(self.timeout)
+            s = socket.create_connection(self.addr,
+                                         timeout=self.connect_timeout)
+            s.settimeout(self.connect_timeout)
             self._sock = s
             try:
                 self.local_addr = s.getsockname()
@@ -859,6 +867,11 @@ class ControlClient:
                         PROTOCOL_MINOR, int(parts[2]))
         except OSError:
             return False
+        # 握手完成 -> 恢复正常超时(探测期用的是短超时)
+        try:
+            self._sock.settimeout(self.timeout)
+        except OSError:
+            pass
         return True
 
     def _send_line(self, line: str) -> None:

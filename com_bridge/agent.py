@@ -171,6 +171,29 @@ class Agent:
     #   为什么需要它: "副机某块屏移动迟滞"这种主观描述无法定位 —— 必须看到
     #   (接收速率, 批深/合并数, 单批注入耗时, 光标所在屏) 四个量才能判断
     #   是"系统/驱动注入慢"还是"我们在排队"。见 transport.coalesce_moves。
+    # ★★★ 等待主电脑 / 断线重连的**固定**探测间隔(秒)。2026-10-26 用户:
+    #   "开机后自动握手连接的过程太慢了。我之前定的不是每5秒请求一次么？"
+    #   旧实现是指数退避(1->2->4->5), 上限看着是 5s, 但**连接尝试本身**还会
+    #   阻塞(ControlClient 默认 5s 超时), 实测间隔 6.5~9.5s。
+    #   现在: 节拍从**本次探测发起时刻**算, 固定 5s 一格; 探测用 1s 短超时,
+    #   保证"尝试 + 等待"总是 5s。
+    HOST_RETRY_INTERVAL_S = float(
+        os.environ.get("COM_BRIDGE_HOST_RETRY_S") or 5.0)
+    PROBE_CONNECT_TIMEOUT_S = 1.0
+
+    @staticmethod
+    def retry_delay(elapsed_s: float, interval_s: float | None = None) -> float:
+        """本次探测已经花了 elapsed_s, 还要再等多久才是下一格(纯函数, 可测)。
+
+        ★ 关键在"从**发起**时刻算": 连接尝试本身可能阻塞(主机还没监听端口时
+          TCP 会重试), 若只按"上次等待结束"起算, 实际间隔 = 尝试耗时 + 间隔,
+          用户就会看到"比 5 秒慢"(实测 6.5~9.5s)。
+          下限 0.2s 防止在极快失败时空转烧 CPU。
+        """
+        interval = (Agent.HOST_RETRY_INTERVAL_S if interval_s is None
+                    else float(interval_s))
+        return max(0.2, interval - max(0.0, float(elapsed_s)))
+
     DIAG_LAT = (bool(os.environ.get("COM_BRIDGE_DIAG_LAT"))
                 or os.path.exists(os.path.join(
                     os.environ.get("LOCALAPPDATA") or "", "ComBridge",
@@ -352,8 +375,10 @@ class Agent:
             while True:
                 if self._stop.is_set():
                     raise HostWaitCancelled("等待主电脑期间被取消")
-                beacon = BeaconListener(
-                    timeout_s=self.discover_timeout_s).listen_once()
+                t0 = time.monotonic()
+                listen_s = min(max(0.2, self.HOST_RETRY_INTERVAL_S - 0.5),
+                               self.discover_timeout_s)
+                beacon = BeaconListener(timeout_s=listen_s).listen_once()
                 if beacon is not None:
                     self._clear_wait()
                     print(f"[agent] 发现主电脑 {beacon.name} @ {beacon.host}",
@@ -362,7 +387,9 @@ class Agent:
                 if self._stop.is_set():
                     raise HostWaitCancelled("等待主电脑期间被取消")
                 self._park("discover", "主电脑广播")
-                if self._stop.wait(1.0):
+                # 补齐到固定间隔(从本次探测**发起**算起)
+                delay = self.retry_delay(time.monotonic() - t0)
+                if self._stop.wait(delay):
                     raise HostWaitCancelled("等待主电脑期间被取消")
         except BaseException:
             self._clear_wait()
@@ -375,12 +402,14 @@ class Agent:
           压在 5 秒内"), 这样冷启动等待和运行期重连的手感相同。
         """
         self._begin_wait("connect")
-        backoff = 1.0
         try:
             while True:
                 if self._stop.is_set():
                     raise HostWaitCancelled("等待主电脑期间被取消")
-                ctrl = ControlClient(host, self.control_port or CONTROL_PORT)
+                t0 = time.monotonic()
+                ctrl = ControlClient(
+                    host, self.control_port or CONTROL_PORT,
+                    connect_timeout=self.PROBE_CONNECT_TIMEOUT_S)
                 if ctrl.connect():
                     self._clear_wait()
                     return ctrl
@@ -389,9 +418,10 @@ class Agent:
                 except Exception:  # noqa: BLE001
                     pass
                 self._park("connect", f"主电脑 {host} 就绪")
-                if self._stop.wait(backoff):
+                # ★ 固定节拍: 从**本次探测发起**算起补满 5s
+                delay = self.retry_delay(time.monotonic() - t0)
+                if self._stop.wait(delay):
                     raise HostWaitCancelled("等待主电脑期间被取消")
-                backoff = min(backoff * 2, 5.0)
         except BaseException:
             self._clear_wait()
             raise
@@ -969,21 +999,22 @@ class Agent:
             host = self.server_host
             if not host:
                 break
-            print(f"[agent] 控制通道断开 -> {backoff:.0f}s 后重连 {host}",
+            print(f"[agent] 控制通道断开 -> 每 "
+                  f"{self.HOST_RETRY_INTERVAL_S:.0f}s 重连一次 {host}",
                   flush=True)
-            if self._stop.wait(backoff):
+            if self._stop.wait(max(0.2, backoff)):
                 break
-            # ★ 指数退避, 上限 **5s**(用户要求: "副机在重连主机连接时的
-            #   请求间隔要压在5秒之内, 30秒太长了")。
-            #   上限 30s 时, 主机短暂重启/网络抖动后要等半分钟才能恢复,
-            #   用户会觉得"程序卡死了"。5s 足够避免对端被压垮, 又能让
-            #   恢复几乎无感。2 -> 4 -> 5 -> 5 ...
-            backoff = min(backoff * 2, 5.0)
+            # ★ 2026-10-26 改为**固定** 5s(用户: "我之前定的不是每5秒
+            #   请求一次么")。原来 2->4->5 的退避, 加上 connect 自身还能阻塞
+            #   5s, 实测间隔 6.5~10s。现在恒定 5s 一格, 探测超时压到 1s。
+            backoff = self.HOST_RETRY_INTERVAL_S
             if self._stop.is_set():
                 break
             try:
                 self._control.close()
-                ctrl = ControlClient(host, self.control_port or CONTROL_PORT)
+                ctrl = ControlClient(
+                    host, self.control_port or CONTROL_PORT,
+                    connect_timeout=self.PROBE_CONNECT_TIMEOUT_S)
                 if not ctrl.connect():
                     print("[agent] 重连失败(主电脑未就绪?), 稍后重试",
                           flush=True)
