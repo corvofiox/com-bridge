@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from com_bridge.input import EdgeDetector, ScreenRect, clamp_to_edge
 
 
@@ -371,6 +373,20 @@ class TestCrossingSemantics:
 
 
 class TestClampBounds:
+    """钳制逻辑本身, **不依赖开发机的实际分辨率**。
+
+    ★ 2026-11-03: 这两条原来写死 1920x1080（`clamp_to_edge(5000,5000) ==
+      (1919,1079)`），而 `clamp_to_edge` 读的是**真实虚拟桌面** —— 换显示器
+      或改缩放就会红（实测：桌面变成 3000x1456 后两条全挂）。要测的是
+      "上界取 right-1 而不是 right"这个逻辑，所以把桌面固定成替身。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fixed_desktop(self, monkeypatch):
+        import com_bridge.input as inp
+        monkeypatch.setattr(inp, "_virtual_screen",
+                            lambda: ScreenRect(0, 0, 1920, 1080))
+
     def test_clamp_uses_reachable_pixel(self):
         assert clamp_to_edge(5000, 5000) == (1919, 1079)
         assert clamp_to_edge(-100, -100) == (0, 0)
@@ -379,8 +395,8 @@ class TestClampBounds:
         """钳制结果必须是光标真能到达的坐标, 否则判定逻辑会错乱。"""
         for x, y in ((1919, 540), (1920, 540), (9999, 9999)):
             cx, cy = clamp_to_edge(x, y)
-            assert 0 <= cx <= MON.right - 1
-            assert 0 <= cy <= MON.bottom - 1
+            assert 0 <= cx <= 1920 - 1
+            assert 0 <= cy <= 1080 - 1
 
 
 class TestMultiMonitorReturnEdge:
