@@ -65,3 +65,17 @@ tools/icons/make_tray_spec.py
 tools/icons/make_v6_spec.py
 tools/icons/make_spec_sheet.py
 tools/icons/check_icons.py
+
+# ★★★ 防止把"别的会话/别的项目"的产物扫进仓库(2026-11-03 事故):
+#   一次 `git add -A` 把 UVR/MDX 人声分离的音频与模型(78 个文件 / 336MB)
+#   一起提交了, 已用 filter-branch 从历史清除。这些后缀/目录本项目不用,
+#   一律忽略; 要加音频素材请单独放 tests/fixtures 并在下面放行。
+*.wav
+*.mp3
+*.flac
+*.onnx
+*.pth
+models/
+chunks/
+sep_out/
+big/
